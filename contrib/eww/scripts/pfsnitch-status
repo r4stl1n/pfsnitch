@@ -8,14 +8,21 @@ set -u
 # from the daemon's argv would show whatever it was *started* with and go stale
 # the moment anyone toggles it.
 RUNNING=false
-P=$(pgrep -x pfsnitch 2>/dev/null | head -1)
-if [ -n "$P" ]; then
-    # Check argv, not just the name: `pfsnitch mode` (run two lines below)
-    # matches a bare name check and would report the daemon as up when it isn't.
+# Check argv, not just the process name - `pfsnitch mode` below, and the sibling
+# poll scripts, are all called "pfsnitch" too.
+#
+# And check EVERY match, not just the first. Taking head -1 meant that whenever
+# a CLI invocation happened to be listed first, its argv did not look like the
+# daemon's and the chip reported "off" while the firewall was running perfectly
+# well. A security indicator that lies about being off is worse than none.
+for P in $(pgrep -x pfsnitch 2>/dev/null); do
     case " $(ps -o args= -p "$P" 2>/dev/null) " in
-        *" enforcement "*|*" enforce "*|*" visibility "*|*" listen "*) RUNNING=true ;;
+    *" enforcement "*|*" enforce "*|*" visibility "*|*" listen "*)
+        RUNNING=true
+        break
+        ;;
     esac
-fi
+done
 
 MODE=$(pfsnitch mode 2>/dev/null)
 [ "$RUNNING" = true ] || MODE=off

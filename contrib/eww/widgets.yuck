@@ -97,7 +97,13 @@
     (box :class "rulehead" :orientation "h" :space-evenly false :spacing 8
       (label :class "seclabel" :text "rules" :halign "start")
       (box :hexpand true)
-      (label :class "seclabel" :text "${snitch.total} total" :halign "end"))
+      (label :class "seclabel" :text "${snitch.total} total" :halign "end")
+      ;; Deliberately here, not beside the per-app controls: a misjudged click
+      ;; on a row must not be able to land on "remove everything".
+      (button :class {snitch_armed == "::all::" ? "clearbtn armed" : "clearbtn"}
+              :tooltip "remove every rule"
+              :onclick "~/.config/eww/scripts/pfsnitch-clear-all"
+        {snitch_armed == "::all::" ? "remove all ${snitch.total}?" : "clear all"}))
 
     ;; Fixed height so the panel does not resize as rules come and go - a
     ;; window that changes size under the pointer is hard to click.

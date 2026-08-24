@@ -392,3 +392,29 @@ The bundled panel offers this as an `×` at the end of each application row, in
 "sure?"), the second performs it, and it disarms itself after four seconds. The
 action is bulk, irreversible from the panel, and sits one button away from a
 harmless info control — a single misclick should not discard weeks of decisions.
+
+## Clearing everything
+
+```sh
+pfsnitch clear --yes
+```
+
+Removes every rule and every pinned `app-id`, keeping the previous policy as
+`policy.conf.bak`. The `default`, `mode` and `prompt` directives survive: they
+describe how pfsnitch behaves rather than what it permits, and silently
+resetting the mode while clearing a rule set would be a nasty surprise.
+
+Without `--yes` it refuses and says what it would do. In `enforcement` it also
+warns that the rules about to go include the ones keeping the machine on the
+network — your gateway and resolver — so every connection will prompt until you
+approve them again, starting with DNS.
+
+**In `visibility` it will not stay cleared.** Anything actively connecting is
+re-learned within seconds; in testing, a `socat` link to the gateway was back
+before the command finished. Clear from `enforcement` if you want a blank slate.
+
+The panel offers this as "clear all" in the rules header — deliberately away
+from the per-application controls, so a misjudged click on a row cannot land on
+"remove everything". It arms first, showing the count it is about to destroy,
+and shares its armed state with the per-app buttons so only one destructive
+action can ever be primed at a time.

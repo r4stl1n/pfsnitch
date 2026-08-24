@@ -1175,3 +1175,36 @@ pub fn remove_app(path: &Path, exe: &str) -> io::Result<(usize, String)> {
     }
     Ok((removed, backup))
 }
+
+/// Remove every rule, keeping the settings that are not rules.
+///
+/// `default`, `mode` and `prompt` survive: they describe how pfsnitch behaves,
+/// not what it permits, and silently resetting the mode while clearing a rule
+/// set would be a nasty surprise. Comments survive too, so a hand-annotated
+/// policy keeps its annotations.
+///
+/// Takes a backup. This is the single most destructive thing the tool can do.
+pub fn clear_rules(path: &Path) -> io::Result<(usize, String)> {
+    let text = fs::read_to_string(path)?;
+    let backup = format!("{}.bak", path.display());
+    fs::write(&backup, &text)?;
+
+    let mut kept = String::new();
+    let mut removed = 0usize;
+    for raw in text.lines() {
+        let is_rule = match parse_line(raw) {
+            Some((k, _, _)) => KINDS.contains(&k.as_str()) || k == "app-id",
+            None => false,
+        };
+        if is_rule {
+            removed += 1;
+            continue;
+        }
+        kept.push_str(raw);
+        kept.push('\n');
+    }
+    if removed > 0 {
+        write_atomic(path, &kept)?;
+    }
+    Ok((removed, backup))
+}

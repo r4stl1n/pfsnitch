@@ -43,6 +43,7 @@ fn main() {
         "mode" => cmd_mode(&args),
         "apps" => cmd_apps(&args),
         "forget" => cmd_forget(&args),
+        "clear" => cmd_clear(&args),
         "help" | "-h" | "--help" => usage(0),
         other => {
             eprintln!("pfsnitch: unknown command {other:?}");
@@ -76,6 +77,7 @@ rules (any frontend can drive these - see --json):
   pfsnitch deny  app <path>   block a binary
   pfsnitch rm <kind> <value>  remove rules, e.g. rm allow-host example.com
   pfsnitch forget <binary>    remove every rule for one binary (keeps a backup)
+  pfsnitch clear --yes        remove ALL rules (keeps a backup)
 
 The policy file is plain text and is re-read automatically within a second of
 changing, so editing it by hand or from a script works exactly as well as these
@@ -885,6 +887,39 @@ fn cmd_forget(args: &[String]) {
         }
         Ok((n, backup)) => {
             println!("removed {n} rule{} for {exe}", if n == 1 { "" } else { "s" });
+            println!("  previous policy saved as {backup}");
+        }
+        Err(e) => {
+            eprintln!("pfsnitch: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_clear(args: &[String]) {
+    let path = Path::new(POLICY_PATH);
+    let rs = policy::rules(path);
+    let pol = policy::Policy::load(path);
+
+    // Saying yes to this in a shell should take more than one word.
+    if !args.iter().any(|a| a == "--yes") {
+        println!("this removes ALL {} rules from {}", rs.len(), path.display());
+        if pol.mode(policy::Mode::Visibility).enforcing() {
+            // Worth spelling out: the rules about to go include the ones
+            // keeping this machine on the network.
+            println!();
+            println!("  you are in ENFORCEMENT. Clearing includes the infrastructure rules -");
+            println!("  your gateway and resolver - so every connection will prompt until you");
+            println!("  approve them again, starting with DNS.");
+        }
+        println!();
+        println!("  re-run with --yes to do it (the previous policy is kept as a .bak)");
+        std::process::exit(1);
+    }
+    match policy::clear_rules(path) {
+        Ok((0, _)) => println!("no rules to clear"),
+        Ok((n, backup)) => {
+            println!("cleared {n} rules");
             println!("  previous policy saved as {backup}");
         }
         Err(e) => {

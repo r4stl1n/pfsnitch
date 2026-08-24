@@ -1,0 +1,28 @@
+#!/bin/sh
+# Arm, then confirm, then remove every rule.
+#
+# The most destructive thing the panel can do, so it is two-stage like the
+# per-app button - and deliberately placed in the rules header rather than
+# beside the per-app controls, so a misjudged click on a row cannot land here.
+#
+# It shares snitch_armed with the per-app buttons, so arming this disarms those
+# and vice versa: only one destructive action can ever be primed at a time.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+if [ "${PFSNITCH_DETACHED:-0}" != 1 ]; then
+    PFSNITCH_DETACHED=1
+    export PFSNITCH_DETACHED
+    daemon -f "$0"
+    exit 0
+fi
+
+if [ "$(eww get snitch_armed 2>/dev/null)" = "::all::" ]; then
+    doas -n pfsnitch clear --yes >/dev/null 2>&1
+    eww update snitch_armed=""
+else
+    eww update snitch_armed="::all::"
+    sleep 4
+    [ "$(eww get snitch_armed 2>/dev/null)" = "::all::" ] && eww update snitch_armed=""
+fi
