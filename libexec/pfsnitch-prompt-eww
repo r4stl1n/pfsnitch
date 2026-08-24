@@ -39,7 +39,8 @@ asuser() {
 }
 
 pf_init
-asuser "eww update lf_exe='$EXE' lf_pid='$PID' lf_cmd='$CMD' lf_dst='$DST' lf_dport='$DPORT' lf_host='$HOST' lf_idstate='$IDSTATE'"
+SCOPEWARN=$(pf_scope_warning)
+asuser "eww update lf_exe='$EXE' lf_pid='$PID' lf_cmd='$CMD' lf_dst='$DST' lf_dport='$DPORT' lf_host='$HOST' lf_idstate='$IDSTATE' lf_scope='$SCOPE' lf_scopewarn='$SCOPEWARN'"
 asuser "eww open lfprompt"
 ANS=$(pf_wait 120)
 asuser "eww close lfprompt"

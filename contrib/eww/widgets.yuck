@@ -15,6 +15,11 @@
 ;; approved. Shown prominently: a user who does not know that will just click
 ;; allow, which is exactly the failure this check exists to prevent.
 (defvar lf_idstate "ok")
+;; How the daemon attributed the connection: exact | local | port | none.
+;; "none" changes what the buttons MEAN - an approval with no binary to attach
+;; to becomes a global rule - so the dialog has to say so.
+(defvar lf_scope "unknown")
+(defvar lf_scopewarn "")
 
 ;; ------------------------------ widgets -----------------------------
 (defpoll snitch :interval "10s"
@@ -200,7 +205,14 @@
              :halign "start"
              :text {lf_idstate == "changed"
                     ? "This file is not the one you approved. Its rules are ignored."
-                    : ""}))
+                    : ""})
+      ;; Attribution quality. Rendered like the binary-changed warning because
+      ;; it carries the same kind of surprise: what you are about to approve is
+      ;; broader than the dialog otherwise implies.
+      (label :class {lf_scope == "none" || lf_scope == "port" ? "lfwarn on" : "lfwarn"}
+             :halign "start"
+             :wrap true
+             :text lf_scopewarn))
     ;; Two rows of two, so allow and block are visibly symmetric: each has a
     ;; "this destination" option and a "whole binary" option. Block defaults to
     ;; the narrow one - blocking an app's metrics endpoint should not take the
@@ -208,16 +220,36 @@
     (box :orientation "v" :space-evenly false :spacing 6
       (box :orientation "h" :space-evenly true :spacing 8
         (button :class "lfbtn once" :onclick "pfsnitch-answer allow-conn" "Allow connection")
-        (button :class "lfbtn app"  :onclick "pfsnitch-answer allow-app"  "Allow app"))
+        ;; Hidden when unattributed: the daemon has no binary to attach an
+        ;; app-wide rule to, so it writes nothing and the same prompt returns.
+        ;; A button that silently loops is worse than no button. Revealer rather
+        ;; than :visible - :visible is unreliable in eww, as this config found
+        ;; out elsewhere.
+        (revealer :transition "slideright" :reveal {lf_scope != "none"}
+          (button :class "lfbtn app" :onclick "pfsnitch-answer allow-app" "Allow app")))
       (box :orientation "h" :space-evenly true :spacing 8
-        (button :class "lfbtn block"    :onclick "pfsnitch-answer block-conn" "Block connection")
-        (button :class "lfbtn blockapp" :onclick "pfsnitch-answer block-app"  "Block app")))
+        (button :class "lfbtn block" :onclick "pfsnitch-answer block-conn" "Block connection")
+        (revealer :transition "slideright" :reveal {lf_scope != "none"}
+          (button :class "lfbtn blockapp" :onclick "pfsnitch-answer block-app" "Block app"))))
     ;; Allow app is enforced by the daemon, not the firewall - pf cannot
     ;; match a process. Approved destinations are open to everything.
     (box :class "lfnotes" :orientation "v" :space-evenly false
-      (label :class "lfnote" :xalign 0 :text "Allow connection approves this destination for this binary only.")
-      (label :class "lfnote" :xalign 0 :text "Block connection denies this destination to this binary only.")
-      (label :class "lfnote" :xalign 0 :text "The app-wide options cover every destination."))))
+      ;; These notes have to track reality. With no binary identified there is
+      ;; nothing to scope a rule to, so the honest wording is "every
+      ;; application" - the old text said "this binary only" regardless, which
+      ;; was simply wrong for an unattributed prompt.
+      (label :class "lfnote" :xalign 0
+             :text {lf_scope == "none"
+                    ? "Allow connection approves this destination for EVERY application."
+                    : "Allow connection approves this destination for this binary only."})
+      (label :class "lfnote" :xalign 0
+             :text {lf_scope == "none"
+                    ? "Block connection denies this destination to every application."
+                    : "Block connection denies this destination to this binary only."})
+      (label :class "lfnote" :xalign 0
+             :text {lf_scope == "none"
+                    ? "The app-wide options cannot be scoped without a binary."
+                    : "The app-wide options cover every destination."}))))
 
 ;; ------------------------------ windows -----------------------------
 (defwindow lfprompt

@@ -28,6 +28,8 @@ pf_init
     printf '  pfsnitch: outbound connection request\n'
     printf '    %s\n' "$(pf_describe)"
     printf '    binary: %s\n' "$EXE"
+    _warn=$(pf_scope_warning)
+    [ -n "$_warn" ] && printf '    !! %s\n' "$_warn"
     printf "    [c] allow connection  [a] allow app  [b] block connection  [B] block app  (60s -> timeout)\n"
     printf '  choice: '
 } > "$TTY" 2>/dev/null

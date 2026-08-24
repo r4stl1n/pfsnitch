@@ -85,9 +85,12 @@ pub struct Policy {
     allow_host: HashSet<Target>,
     deny_host: HashSet<Target>,
     allow_dest: HashSet<(IpAddr, Option<u16>)>,
-    /// Destinations denied to ONE binary, leaving it otherwise working.
-    /// This is what "Block" produces: blocking a metrics endpoint should not
-    /// take the whole application off the network.
+    /// Addresses denied to every binary. The mirror of allow_dest, and the
+    /// reason it exists: without it, "Block" on a connection we could not
+    /// attribute had nowhere to write, so `record` silently returned and the
+    /// click did nothing at all. Allowing an unattributed connection worked
+    /// while blocking one did not, which is the wrong asymmetry for a firewall.
+    deny_dest: HashSet<(IpAddr, Option<u16>)>,
     /// Destinations approved for ONE binary. This is what "Allow connection"
     /// writes when we know which binary asked, so approving a host for one
     /// program does not quietly open it for every other program too.
@@ -173,6 +176,13 @@ impl Policy {
                     let (a, pt) = split_target(v);
                     match a.parse::<IpAddr>() {
                         Ok(addr) => { p.allow_dest.insert((addr, pt)); }
+                        Err(_) => eprintln!("policy:{}: bad address {a:?}", n + 1),
+                    }
+                }
+                "deny-dest" => {
+                    let (a, pt) = split_target(v);
+                    match a.parse::<IpAddr>() {
+                        Ok(addr) => { p.deny_dest.insert((addr, pt)); }
                         Err(_) => eprintln!("policy:{}: bad address {a:?}", n + 1),
                     }
                 }
@@ -262,6 +272,12 @@ impl Policy {
             if Self::host_matches(&self.deny_host, h, dport) {
                 return Verdict::Deny;
             }
+        }
+        // Sits with deny-host, not with the allow sets: a machine-wide deny by
+        // address has to outrank a per-app approval, or blocking an address
+        // would do nothing for any app that had already been approved.
+        if Self::dest_matches(&self.deny_dest, dst, dport) {
+            return Verdict::Deny;
         }
         if let Some(e) = exe {
             if self.deny_app.contains(e) {
@@ -362,7 +378,14 @@ impl Policy {
                     self.allow_app.insert(e.to_string());
                     format!("allow-app {e}")
                 }
-                None => return,
+                // As above: no binary, no app-wide rule. Logged rather than
+                // silently dropped.
+                None => {
+                    eprintln!(
+                        "pfsnitch: 'allow app' ignored - this connection could not be attributed to a binary"
+                    );
+                    return;
+                }
             },
             Answer::Block => match exe {
                 // Mirror of AllowConn: prefer the NAME when we saw one, so the
@@ -384,14 +407,41 @@ impl Policy {
                         )
                     }
                 },
-                None => return,
+                // Unattributed. Previously this returned and the click did
+                // nothing - the user saw a dialog, pressed Block, and no rule
+                // was written. A machine-wide deny is broader than they asked
+                // for, so it is labelled, but it is what "block this" can mean
+                // when there is no binary to attach it to.
+                None => match host {
+                    Some(h) if !h.is_empty() && h != "-" => {
+                        self.deny_host.insert((h.to_lowercase(), port));
+                        format!(
+                            "deny-host {}\t# unattributed connection; blocked for every application",
+                            join_target(h, port)
+                        )
+                    }
+                    _ => {
+                        self.deny_dest.insert((dst, port));
+                        format!(
+                            "deny-dest {}\t# unattributed, no hostname seen; blocked for every application",
+                            join_target(&dst.to_string(), port)
+                        )
+                    }
+                },
             },
             Answer::BlockApp => match exe {
                 Some(e) => {
                     self.deny_app.insert(e.to_string());
                     format!("deny-app {e}\t# every destination")
                 }
-                None => return,
+                // An app-wide rule needs an app. Nothing can be written, so say
+                // so rather than letting the button appear to work.
+                None => {
+                    eprintln!(
+                        "pfsnitch: 'block app' ignored - this connection could not be attributed to a binary"
+                    );
+                    return;
+                }
             },
             Answer::Timeout => return,
         };
@@ -441,6 +491,7 @@ pub const KINDS: &[&str] =
         "allow-host",
         "deny-host",
         "allow-dest",
+        "deny-dest",
         "allow-host-from",
         "allow-dest-from",
         "deny-host-from",
@@ -480,7 +531,7 @@ fn normalise(kind: &str, value: &str) -> String {
             }
             None => value.to_string(),
         },
-        "allow-dest" => {
+        "allow-dest" | "deny-dest" => {
             let (a, p) = split_target(value);
             match a.parse::<IpAddr>() {
                 Ok(addr) => join_target(&addr.to_string(), p),
@@ -546,10 +597,13 @@ pub fn add_rule(path: &Path, kind: &str, value: &str, note: Option<&str>) -> io:
             }
         }
     }
-    if kind == "allow-dest" && split_target(value).0.parse::<IpAddr>().is_err() {
+    if (kind == "allow-dest" || kind == "deny-dest")
+        && split_target(value).0.parse::<IpAddr>().is_err()
+    {
+        let alt = if kind == "deny-dest" { "deny-host" } else { "allow-host" };
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{value:?} is not an IP address - use allow-host for names"),
+            format!("{value:?} is not an IP address - use {alt} for names"),
         ));
     }
     let norm = normalise(kind, value);
@@ -751,6 +805,107 @@ mod tests {
 
     const APP: &str = "/usr/local/bin/someapp";
     const OTHER: &str = "/usr/local/bin/otherapp";
+
+    #[test]
+    fn deny_dest_is_a_listed_kind() {
+        // Not cosmetic: `rules`, `status` and `rm` all enumerate KINDS, so a
+        // kind missing from it is invisible and unremovable from the CLI.
+        assert!(KINDS.contains(&"deny-dest"));
+    }
+
+    #[test]
+    fn deny_dest_blocks_every_application() {
+        let (pol, path) = load_from("deny-dest", "default allow\ndeny-dest 203.0.113.9\n");
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), dst, None, 443), Verdict::Deny);
+        assert_eq!(pol.decide(Some(OTHER), dst, None, 443), Verdict::Deny);
+        assert_eq!(pol.decide(None, dst, None, 443), Verdict::Deny);
+        let elsewhere = "198.51.100.7".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), elsewhere, None, 443), Verdict::Allow);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deny_dest_outranks_a_per_app_allow() {
+        // Same reasoning as deny-host: if an existing approval could shadow it,
+        // blocking an address would do nothing for the apps already trusted -
+        // which are exactly the ones worth blocking it for.
+        let (pol, path) = load_from(
+            "deny-dest-prec",
+            "default ask\nallow-app /usr/local/bin/someapp\ndeny-dest 203.0.113.9\n",
+        );
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), dst, None, 443), Verdict::Deny);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deny_dest_honours_its_port_scope() {
+        let (pol, path) = load_from("deny-dest-port", "default allow\ndeny-dest 203.0.113.9:443\n");
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), dst, None, 443), Verdict::Deny);
+        assert_eq!(
+            pol.decide(Some(APP), dst, None, 80),
+            Verdict::Allow,
+            "a port-scoped deny must not close other ports"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn blocking_an_unattributed_connection_actually_writes_a_rule() {
+        // The regression this fixes: with no binary to scope to, `record`
+        // returned early. The dialog appeared, Block was pressed, and nothing
+        // was written - while pressing Allow on that same dialog DID write a
+        // global rule. Allow-but-never-block is the wrong way for a firewall
+        // to be asymmetric.
+        let (mut pol, path) = load_from("unattr-block", "default ask\n");
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        pol.record(&path, Answer::Block, None, dst, None, 443, Origin::Approved);
+
+        assert_eq!(pol.decide(None, dst, None, 443), Verdict::Deny);
+        assert_eq!(
+            pol.decide(Some(APP), dst, None, 443),
+            Verdict::Deny,
+            "a machine-wide block has to cover attributed traffic too"
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("deny-dest 203.0.113.9:443"), "got: {text}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn blocking_an_unattributed_connection_prefers_the_hostname() {
+        // A name outlives any single address, so the block follows the site
+        // rather than pinning one rotating CDN address.
+        let (mut pol, path) = load_from("unattr-block-host", "default ask\n");
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        pol.record(&path, Answer::Block, None, dst, Some("metrics.example.com"), 443, Origin::Approved);
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("deny-host metrics.example.com:443"), "got: {text}");
+        let moved = "198.51.100.7".parse::<IpAddr>().unwrap();
+        assert_eq!(
+            pol.decide(None, moved, Some("metrics.example.com"), 443),
+            Verdict::Deny,
+            "the block must follow the name to a new address"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_app_wide_answer_without_a_binary_writes_nothing() {
+        // There is genuinely no app to attach these to. What matters is that
+        // they do not quietly widen into something machine-wide instead.
+        let (mut pol, path) = load_from("unattr-appwide", "default ask\n");
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        pol.record(&path, Answer::AllowApp, None, dst, None, 443, Origin::Approved);
+        pol.record(&path, Answer::BlockApp, None, dst, None, 443, Origin::Approved);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "default ask\n");
+        assert_eq!(pol.decide(None, dst, None, 443), Verdict::Ask);
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn blocking_one_destination_leaves_the_app_otherwise_working() {

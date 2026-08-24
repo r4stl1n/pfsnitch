@@ -49,6 +49,7 @@ own line is a complete rule. Hand-editing is an interface, not a workaround.
 | `allow-host`      | a hostname, **any binary** | infrastructure: a resolver, a gateway |
 | `deny-host`       | a hostname, any binary | |
 | `allow-dest`      | one address, any binary | |
+| `deny-dest`       | one address, any binary | what *Block connection* writes when nothing could be attributed |
 | `app-id`          | pins a binary's sha256 | see *Binary identity* below |
 
 Hostname rules are preferred over addresses: one rule covers every address a
@@ -108,23 +109,56 @@ host for one program would silently re-open it for one you had blocked.
 
 1. `deny-dest-from` / `deny-host-from` — this binary, this destination
 2. `deny-host` — this host, any binary
-3. `deny-app` — this binary, anywhere
-4. `allow-dest-from` / `allow-host-from` — this binary, this destination
-5. `allow-app` — this binary, anywhere
-6. `allow-host` / `allow-dest`
-7. the `default`
+3. `deny-dest` — this address, any binary
+4. `deny-app` — this binary, anywhere
+5. `allow-dest-from` / `allow-host-from` — this binary, this destination
+6. `allow-app` — this binary, anywhere
+7. `allow-host` / `allow-dest`
+8. the `default`
+
+The machine-wide denies sit above every allow deliberately. If an existing
+approval could shadow them, blocking an address would do nothing for the
+applications already trusted — which are precisely the ones worth blocking it
+for.
 
 ### When the binary is unknown
 
-Attribution can fail: a short-lived process may exit between its SYN and the
-scan that identifies it. A per-binary rule cannot match a connection with no
-binary attached, so those fall through to the `default` rather than being
-allowed — the safe direction, but worth knowing.
+Attribution is tiered, because not every socket carries the same evidence.
+`pfsnitch probe` prints the tier it used for each socket in its `HOW` column.
 
-When *Allow connection* is answered for a connection that could not be
-attributed, pfsnitch falls back to an unscoped rule and marks it
-`# unattributed connection`, because it is broader than you asked for and should
-be easy to find on review.
+| tier | matched on | typical case |
+|---|---|---|
+| `exact` | the full 4-tuple of a connected socket | anything that called `connect()` — all TCP, and libc's resolver |
+| `local` | an unconnected socket's bound address and port | `sendto()` senders: ntpd, mDNS, SSDP, DHCP clients |
+| `port`  | an unconnected socket's local port alone | a wildcard bind such as `*:123` |
+| `none`  | nothing matched | kernel-originated traffic (ICMP, IPv6 ND), or a process that exited first |
+
+The two weak tiers exist because requiring a peer address made every
+*unconnected* UDP socket invisible. `sendto()` without `connect()` leaves the
+peer zeroed, so `ntpd` — which holds `*:123` alongside its real addresses — could
+never be named, and its traffic earned machine-wide rules instead of rules
+scoped to `ntpd`.
+
+They are consulted for **outbound** packets only. On an inbound packet the local
+end is the *destination*, so matching a source port against local sockets would
+credit whatever holds that port: a resolver bound to `:53` would be blamed for
+every DNS reply it never asked for.
+
+A weak key claimed by two different processes is **refused**, not guessed.
+Naming the wrong application is worse than naming none — you would approve a
+rule for a binary that never made the connection.
+
+A per-binary rule cannot match a connection with no binary attached, so a `none`
+falls through to the `default` rather than being allowed: the safe direction,
+but worth knowing.
+
+The tier reaches the prompt as its 8th argument, and this is where it matters.
+With no binary to scope to, *Allow connection* writes an unscoped rule marked
+`# unattributed connection` that then matches **every** binary on the machine,
+and *Block connection* writes an equally machine-wide `deny-host` / `deny-dest`.
+The app-wide verdicts cannot be written at all — there is no app — so a backend
+should not offer them. The bundled eww prompt shows a warning and hides those
+two buttons.
 
 ## Binary identity
 
@@ -195,7 +229,7 @@ When the daemon needs a decision it runs one program. That program's contract is
 the entire interface:
 
 ```
-argv:   EXE PID COMMAND DST DPORT [HOSTNAME]
+argv:   EXE PID COMMAND DST DPORT [HOSTNAME] [IDSTATE] [SCOPE]
 stdout: exactly one word — allow-conn | allow-app | block-conn | block-app | timeout
 exit:   0
 ```
@@ -209,7 +243,7 @@ Point `prompt` in `policy.conf`, `$PFSNITCH_PROMPT`, or `pfsnitch_prompt` in
 |---|---|
 | `allow-conn` | allow **this destination for this binary** — writes `allow-host-from`, or `allow-dest-from` when no hostname was seen |
 | `allow-app`  | allow the binary everywhere — writes `allow-app` |
-| `block-conn` | deny **this destination to this binary** — writes `deny-host-from` / `deny-dest-from` |
+| `block-conn` | deny **this destination to this binary** — writes `deny-host-from` / `deny-dest-from`, or machine-wide `deny-host` / `deny-dest` when nothing could be attributed |
 | `block-app`  | deny the binary everything — writes `deny-app` |
 | `timeout`    | drop the packet, **write nothing** |
 

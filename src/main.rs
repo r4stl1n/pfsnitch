@@ -163,18 +163,16 @@ fn cmd_add(args: &[String], verb: &str) {
         ("allow", "host", true) => "allow-host-from",
         ("allow", "dest", true) | ("allow", "ip", true) => "allow-dest-from",
         ("allow", "app", _) => "allow-app",
-        (
-"allow", "dest", false) | ("allow", "ip", false) => "allow-dest",
+        ("allow", "dest", false) | ("allow", "ip", false) => "allow-dest",
         ("deny", "host", false) => "deny-host",
         ("deny", "host", true) => "deny-host-from",
         ("deny", "dest", true) | ("deny", "ip", true) => "deny-dest-from",
         ("deny", "app", _) => "deny-app",
-        // deny-dest has no counterpart in the policy engine, so refuse it here
-        // rather than write a rule that would silently never match.
+        ("deny", "dest", false) | ("deny", "ip", false) => "deny-dest",
         _ => {
             eprintln!("pfsnitch: cannot `{verb} {what}`{}", if from.is_some() { " --from ..." } else { "" });
             eprintln!("  allow: host | app | dest | host <name> --from <binary> | dest <ip> --from <binary>");
-            eprintln!("  deny:  host | app | host <name> --from <binary> | dest <ip> --from <binary>");
+            eprintln!("  deny:  host | app | dest | host <name> --from <binary> | dest <ip> --from <binary>");
             std::process::exit(64);
         }
     };
@@ -281,11 +279,25 @@ fn cmd_status(args: &[String]) {
 
 fn probe() {
     let snap = procinfo::snapshot();
-    println!("{:<16} {:>7}  {:<40} {}", "COMMAND", "PID", "PATH", "REMOTE");
-    for (t, o) in &snap {
-        println!("{:<16} {:>7}  {:<40} {}:{}", o.command, o.pid, o.path, t.dst, t.dport);
+    println!("{:<16} {:>7}  {:<40} {:<26} {}", "COMMAND", "PID", "PATH", "REMOTE", "HOW");
+    let mut rows = snap.entries();
+    rows.sort_by(|a, b| {
+        a.owner.command.cmp(&b.owner.command).then(a.lport.cmp(&b.lport))
+    });
+    for e in &rows {
+        let remote = match e.peer {
+            Some((ip, port)) => format!("{ip}:{port}"),
+            // An unconnected socket has no peer at all. What identifies it is
+            // the address and port it is bound to, so show those - otherwise
+            // several sockets of one process render as identical rows.
+            None => format!("(unconnected) {}:{}", e.local, e.lport),
+        };
+        println!(
+            "{:<16} {:>7}  {:<40} {:<26} {}",
+            e.owner.command, e.owner.pid, e.owner.path, remote, e.confidence.as_str()
+        );
     }
-    eprintln!("\n  {} attributable connections", snap.len());
+    eprintln!("\n  {} attributable sockets", rows.len());
 }
 
 /// A prompt that has been raised and not yet answered.
@@ -457,8 +469,18 @@ fn run(fallback_mode: policy::Mode) {
                     let t = procinfo::Tuple {
                         proto: f.proto, src: f.src, sport: f.sport, dst: f.dst, dport: f.dport,
                     };
-                    let owner = res.owner(&t);
+                    // sin_addr == 0 means the kernel wants this sent outbound;
+                    // anything else is an inbound delivery. The weak attribution
+                    // tiers key on the packet's SOURCE as the local end, which is
+                    // only true outbound - see procinfo::Tables::get.
+                    let outbound = from.sin_addr.s_addr == 0;
+                    let att = res.resolve(&t, outbound);
+                    let owner = att.as_ref().map(|a| a.owner.clone());
                     let exe = owner.as_ref().map(|o| o.path.clone());
+                    // "none" is not just a weaker "local": it is what turns an
+                    // accepted prompt into a rule binding EVERY binary, so the
+                    // prompt has to be able to say so.
+                    let scope = att.as_ref().map(|a| a.confidence.as_str()).unwrap_or("none");
                     let hostname = names.name_for(&f.dst).map(|s| s.to_string());
                     // A rule is a standing permission attached to a PATH, but the
                     // file behind a path can be replaced. If the binary is not the
@@ -509,6 +531,7 @@ fn run(fallback_mode: policy::Mode) {
                                     f.dst,
                                     f.dport,
                                     host,
+                                    scope.to_string(),
                                 );
                             }
                         }
@@ -603,6 +626,7 @@ fn spawn_prompt(
     dst: IpAddr,
     dport: u16,
     host: String,
+    scope: String,
 ) {
     std::thread::spawn(move || {
         // keep a copy: the arg below moves the original into the command
@@ -617,6 +641,9 @@ fn spawn_prompt(
             // Optional 7th argument. A backend that does not know about it just
             // ignores it, which is why it goes last.
             .arg(if id_changed { "changed" } else { "ok" })
+            // Optional 8th argument: how the owner was attributed - exact,
+            // local, port, or none. Backends written before it ignore it.
+            .arg(&scope)
             .output();
 
         let ans = match out {

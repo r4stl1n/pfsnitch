@@ -2,7 +2,7 @@
 #
 # THE PROMPT CONTRACT
 #
-#   argv:   EXE PID COMMAND DST DPORT [HOSTNAME]
+#   argv:   EXE PID COMMAND DST DPORT [HOSTNAME] [IDSTATE] [SCOPE]
 #   stdout: one word - allow-conn | allow-app | block-conn | block-app | timeout
 #   exit:   0
 #
@@ -24,6 +24,15 @@ EXE="${1:-?}"; PID="${2:-?}"; CMD="${3:-?}"; DST="${4:-?}"; DPORT="${5:-?}"; HOS
 # 7th argument, optional: "changed" if the binary no longer matches the one
 # whose rules were approved. Absent for backends written before it existed.
 IDSTATE="${7:-ok}"
+# 8th argument, optional: how the daemon attributed the connection.
+#   exact - full 4-tuple match on a connected socket
+#   local - unconnected socket, matched on its bound address and port
+#   port  - unconnected socket, matched on local port alone (weakest)
+#   none  - not attributable to any process
+# Defaults to `unknown` rather than `exact`: an older daemon sends no 8th
+# argument, and claiming certainty we were never given would be the wrong way
+# to be wrong.
+SCOPE="${8:-unknown}"
 
 # Minimal JSON string escaping: backslash and quote only. The values are paths,
 # process names and hostnames, so control characters are not a realistic input,
@@ -45,7 +54,7 @@ pf_init() {
     chmod 0660 "$NONCEF" 2>/dev/null
 
     cat > "$PENDING" 2>/dev/null <<JSON
-{"nonce":"$(jesc "$NONCE")","idstate":"$(jesc "$IDSTATE")","exe":"$(jesc "$EXE")","pid":"$(jesc "$PID")","command":"$(jesc "$CMD")","dst":"$(jesc "$DST")","dport":"$(jesc "$DPORT")","hostname":"$(jesc "$HOST")"}
+{"nonce":"$(jesc "$NONCE")","idstate":"$(jesc "$IDSTATE")","scope":"$(jesc "$SCOPE")","exe":"$(jesc "$EXE")","pid":"$(jesc "$PID")","command":"$(jesc "$CMD")","dst":"$(jesc "$DST")","dport":"$(jesc "$DPORT")","hostname":"$(jesc "$HOST")"}
 JSON
     chmod 0660 "$PENDING" 2>/dev/null
 }
@@ -80,6 +89,26 @@ pf_wait() {
 }
 
 pf_cleanup() { rm -f "$PENDING" "$NONCEF" 2>/dev/null; }
+
+# A warning about how much is actually known about the caller, or nothing when
+# the attribution was solid.
+#
+# This is the part that matters at the moment of consent. Approving a connection
+# the daemon could NOT attribute does not write a rule for one application - it
+# writes a global `allow-dest` that every binary on the system then matches. The
+# dialog otherwise reads as though it were about the one app being named.
+pf_scope_warning() {
+    case "$SCOPE" in
+    none)
+        printf 'UNATTRIBUTED: approving this allows %s port %s for EVERY application' \
+            "$DST" "$DPORT"
+        ;;
+    port)
+        printf 'WEAK MATCH: identified by local port only - %s may not be the sender' \
+            "$CMD"
+        ;;
+    esac
+}
 
 # A one-line human description of the request, shared by the text backends.
 pf_describe() {

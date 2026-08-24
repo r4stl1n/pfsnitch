@@ -57,7 +57,7 @@ phones a metrics endpoint loses the metrics endpoint, not the network.
 | `allow-host-from` / `deny-host-from` | a hostname, **for one binary**, optionally one port |
 | `allow-dest-from` / `deny-dest-from` | one address, **for one binary**, optionally one port |
 | `allow-app` / `deny-app` | one binary, every destination |
-| `allow-host` / `deny-host` / `allow-dest` | any binary — for real infrastructure (a resolver, a gateway) |
+| `allow-host` / `deny-host` / `allow-dest` / `deny-dest` | any binary — for real infrastructure (a resolver, a gateway) |
 | `app-id` | pins the binary's sha256 at the moment it was approved |
 
 Hostname rules are preferred over addresses because they survive round-robin
