@@ -56,7 +56,7 @@
 (defwidget w_snitch []
   ;; Click, not hover: the panel holds buttons, and a hover-close would pull it
   ;; out from under the pointer on the way to them.
-  (eventbox :onclick "eww open --toggle secpopup"
+  (eventbox :onclick "~/.config/eww/scripts/pfsnitch-ui-open"
   (box :class "chip snitch ${snitch.level}" :orientation "h" :space-evenly false :spacing 6
        :tooltip {snitch.tip}
     (label :class "icon" :text {snitch.icon})

@@ -166,3 +166,69 @@ fn endpoint(sa: &sockaddr_storage) -> Option<(IpAddr, u16)> {
         }
     }
 }
+
+/// Is a pfsnitch daemon running?
+///
+/// Answerable WITHOUT privilege, which matters: the previous check bound the
+/// divert port, and only root can do that. Every unprivileged frontend
+/// therefore got "unknown", and at least two of them went on to render that as
+/// "not running" - telling the user the firewall was off when it was not. A
+/// security indicator that lies in that direction is worse than none.
+///
+/// Matches on argv rather than the process name, because `pfsnitch status` is
+/// also called "pfsnitch" and would otherwise count as a daemon.
+pub fn daemon_running() -> bool {
+    const MODES: &[&str] = &["visibility", "enforcement", "listen", "enforce"];
+    let me = std::process::id() as i32;
+
+    unsafe {
+        let ps = procstat_open_sysctl();
+        if ps.is_null() {
+            return false;
+        }
+        let mut cnt: libc::c_uint = 0;
+        let procs = procstat_getprocs(ps, KERN_PROC_PROC as i32, 0, &mut cnt);
+        if procs.is_null() {
+            procstat_close(ps);
+            return false;
+        }
+
+        let mut found = false;
+        for i in 0..cnt as isize {
+            let p = procs.offset(i);
+            if (*p).ki_pid == me {
+                continue;
+            }
+            let argv = procstat_getargv(ps, p, 0);
+            if argv.is_null() {
+                continue;
+            }
+            // argv is a NULL-terminated array of C strings.
+            let mut words: Vec<String> = Vec::new();
+            let mut j = 0isize;
+            while !(*argv.offset(j)).is_null() && j < 8 {
+                words.push(
+                    CStr::from_ptr(*argv.offset(j))
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                j += 1;
+            }
+            procstat_freeargv(ps);
+
+            let is_pfsnitch = words
+                .first()
+                .map(|a| a.rsplit('/').next().unwrap_or(a) == "pfsnitch")
+                .unwrap_or(false);
+            let has_mode = words.get(1).map(|m| MODES.contains(&m.as_str())).unwrap_or(false);
+            if is_pfsnitch && has_mode {
+                found = true;
+                break;
+            }
+        }
+
+        procstat_freeprocs(ps, procs);
+        procstat_close(ps);
+        found
+    }
+}

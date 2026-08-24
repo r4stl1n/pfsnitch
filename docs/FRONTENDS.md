@@ -296,7 +296,11 @@ be changed at runtime. The daemon re-reads the file within a second, which means
 there is no window in which traffic passes unfiltered. Writing `mode
 enforcement` into the file by any means has exactly the same effect as the
 command. `status --json` reports the current mode, so a frontend can render a
-toggle from it.
+toggle from it. It also reports whether the daemon is running, and does so
+without privilege: the check used to bind the divert port, which only root can
+do, so every unprivileged frontend got "unknown" - and more than one went on to
+render that as "not running", telling the user the firewall was off while it was
+running.
 
 The older names `listen` and `enforce` are still accepted everywhere a mode is
 parsed, so existing `rc.conf` entries and scripts keep working.
@@ -418,3 +422,14 @@ from the per-application controls, so a misjudged click on a row cannot land on
 "remove everything". It arms first, showing the count it is about to destroy,
 and shares its armed state with the per-app buttons so only one destructive
 action can ever be primed at a time.
+
+## A second frontend
+
+[pfsnitch-ui](https://github.com/r4stl1n/pfsnitch-ui) is a desktop application
+built on this contract and nothing else — `pfsnitch apps --json` to read,
+`doas pfsnitch ...` to change. It shares no code with the daemon and holds no
+privilege of its own, which is the point: it exists partly as a worked example
+that the contract is sufficient to build a real UI against.
+
+The bundled eww chip launches it (`contrib/eww/scripts/pfsnitch-ui-open`). The
+eww panel is still defined and still works, so you can use either.

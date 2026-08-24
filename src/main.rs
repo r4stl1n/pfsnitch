@@ -241,19 +241,15 @@ fn cmd_status(args: &[String]) {
     let rs = policy::rules(path);
     let count = |k: &str| rs.iter().filter(|r| r.kind == k).count();
 
-    // Whether the daemon is up is answered by trying to take its divert port:
-    // in use means it is running. This needs root, so say "unknown" rather than
-    // guess when we cannot tell - a firewall status that lies is worse than one
-    // that admits ignorance.
-    let running = match divert::Divert::bind(DIVERT_PORT) {
-        Ok(_) => Some(false), // we got the port, so nothing else holds it
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Some(true),
-        Err(_) => None,
-    };
-    let running_s = match running {
-        Some(true) => "running",
-        Some(false) => "stopped",
-        None => "unknown (needs root)",
+    // Liveness by looking for the daemon in the process table, NOT by trying to
+    // bind its divert port. The port test is definitive but needs root, so
+    // every unprivileged frontend got "unknown" - and more than one of them
+    // rendered that as "not running", telling the user the firewall was off
+    // while it was running. This answers for everyone.
+    let running_s = if procinfo::daemon_running() {
+        "running"
+    } else {
+        "stopped"
     };
 
     if args.iter().any(|a| a == "--json") {

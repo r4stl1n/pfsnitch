@@ -1,0 +1,26 @@
+#!/bin/sh
+# Chip click: raise the UI window, or start it if it is not running.
+#
+# Detached, because eww reaps the child of an :onclick when the widget
+# re-renders - and a UI that dies the moment the bar redraws would be a strange
+# thing to ship.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+if [ "${PFSNITCH_DETACHED:-0}" != 1 ]; then
+    PFSNITCH_DETACHED=1
+    export PFSNITCH_DETACHED
+    daemon -f "$0"
+    exit 0
+fi
+
+if pgrep -f '[p]fsnitch-ui' >/dev/null 2>&1; then
+    # Already open: bring it to the front rather than starting a second one.
+    hyprctl dispatch focuswindow 'title:^(pfsnitch)$' >/dev/null 2>&1
+else
+    # exec, not background-and-exit: daemon(8) has already detached us, so the
+    # UI inherits that and lives on. Backgrounding it here and then returning
+    # left it orphaned mid-startup and it died.
+    exec pfsnitch-ui >/dev/null 2>&1
+fi
