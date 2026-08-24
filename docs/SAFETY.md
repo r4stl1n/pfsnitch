@@ -199,10 +199,41 @@ diverted, and pf states are bidirectional, so inbound data is diverted too.
 `keep state` prevents later packets re-evaluating other rules; it does not
 exempt them from the divert.
 
-That works out at roughly **15 µs of CPU per packet**, which puts a
+That works out at roughly **15 µs of CPU per packet** for TCP, which puts a
 single-core ceiling somewhere near 800 Mbit/s at a 1500-byte MTU. On this link
 the cost is a 10–20% throughput reduction. On a gigabit link the daemon would be
 the bottleneck, and on a busy server it would be a serious one.
+
+TCP data and ACK packets are only parsed and reinjected - they carry neither a
+SYN nor UDP, so they never enter the verdict path. That 15 µs is the bare
+divert round trip and nothing else.
+
+### UDP, and the flow cache
+
+UDP is different: every datagram DOES enter the verdict path, and deriving a
+verdict was catastrophically expensive. Attribution falls through to a full
+libprocstat walk of every process and its open files whenever the flow is not
+already cached, which measured at **~2.8 ms per packet**. One video stream was
+enough to peg a core - and worse, the daemon could not drain the divert socket,
+so the kernel dropped the overflow: of 20,000 datagrams, **60 were processed and
+the rest silently discarded**. That is not a slow firewall, it is a broken
+network.
+
+A settled verdict cannot change until the policy does, so it is now cached per
+flow and the rest of the stream skips the derivation entirely:
+
+| | packets processed | CPU |
+|---|---|---|
+| without the cache | 60 of 20,000 | 0.17 s |
+| with the cache | ~7,300 of 20,000 | 0.03 s |
+
+Roughly **4 µs per packet** instead of 2800 - and at a realistic streaming rate
+the daemon sits at **0.5% CPU**. The cache is cleared whenever the policy
+reloads, because every entry in it was derived from the policy that just
+changed.
+
+(The remaining drops above are an artefact of the generator, which fires at
+~500,000 packets/s. A 1080p stream is nearer 500-800.)
 
 ### Why not divert only the SYN
 

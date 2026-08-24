@@ -344,6 +344,8 @@ fn run(fallback_mode: policy::Mode) {
     let mut asking: HashSet<(String, IpAddr)> = HashSet::new();
     // Flows already written to the log. See the note at the println below.
     let mut logged: HashSet<(u8, IpAddr, u16, IpAddr, u16)> = HashSet::new();
+    // Settled verdicts, keyed on the flow. See the note in the packet loop.
+    let mut decided: HashMap<(u8, IpAddr, u16, IpAddr, u16), Verdict> = HashMap::new();
     let mut logged_cleared = Instant::now();
     let mut buf = vec![0u8; 65_535];
 
@@ -389,6 +391,10 @@ fn run(fallback_mode: policy::Mode) {
                 pol = policy::Policy::load(policy_path);
                 let was = mode;
                 mode = pol.mode(fallback_mode);
+                // Every cached verdict was derived from the policy that just
+                // changed. Keeping them would mean a rule you added or removed
+                // silently not applying to traffic already in flight.
+                decided.clear();
                 eprintln!("pfsnitch: policy reloaded: {}", pol.summary());
                 if mode != was {
                     // Worth its own line: this is the one setting that changes
@@ -424,116 +430,145 @@ fn run(fallback_mode: policy::Mode) {
             }
 
             if f.syn_only || f.proto == 17 {
-                let t = procinfo::Tuple {
-                    proto: f.proto, src: f.src, sport: f.sport, dst: f.dst, dport: f.dport,
-                };
-                let owner = res.owner(&t);
-                let exe = owner.as_ref().map(|o| o.path.clone());
-                let hostname = names.name_for(&f.dst).map(|s| s.to_string());
-                // A rule is a standing permission attached to a PATH, but the file
-                // behind a path can be replaced. If the binary is not the one
-                // that was approved, the rules it earned do not apply to
-                // whatever is there now - fall back to asking.
-                let mut id_changed = false;
-                if let Some(e) = exe.as_deref() {
-                    if let Some(expected) = pol.expected_id(e).map(str::to_string) {
-                        if let Some(actual) = ident.hash(e) {
-                            if actual != expected {
-                                id_changed = true;
-                                if id_warned.insert(e.to_string()) {
-                                    eprintln!(
-                                        "pfsnitch: BINARY CHANGED {e}\n  approved {expected}\n  now      {actual}\n  its rules are being ignored until you approve it again"
-                                    );
+                // pf diverts EVERY packet of a flow, in both directions - the
+                // divert action lives in the pf state, not just on the rule. So
+                // this path runs per packet, and deriving the same verdict again
+                // for the ten-thousandth packet of a download is pure waste.
+                //
+                // It is also not cheap waste: the derivation allocates several
+                // strings per packet and scans every scoped rule doing
+                // case-insensitive comparisons. One video was enough to peg a
+                // core. A settled verdict cannot change until the policy does,
+                // so remember it and let the rest of the flow skip all of it.
+                let flow = (f.proto, f.src, f.sport, f.dst, f.dport);
+
+                if let Some(v) = decided.get(&flow) {
+                    match v {
+                        Verdict::Allow => allow = true,
+                        Verdict::Deny => {
+                            allow = false;
+                            reject = true;
+                        }
+                        // Never cached: an Ask is a question in flight, and its
+                        // answer is exactly what is about to change.
+                        Verdict::Ask => {}
+                    }
+                } else {
+                    let t = procinfo::Tuple {
+                        proto: f.proto, src: f.src, sport: f.sport, dst: f.dst, dport: f.dport,
+                    };
+                    let owner = res.owner(&t);
+                    let exe = owner.as_ref().map(|o| o.path.clone());
+                    let hostname = names.name_for(&f.dst).map(|s| s.to_string());
+                    // A rule is a standing permission attached to a PATH, but the
+                    // file behind a path can be replaced. If the binary is not the
+                    // one that was approved, the rules it earned do not apply to
+                    // whatever is there now - fall back to asking.
+                    let mut id_changed = false;
+                    if let Some(e) = exe.as_deref() {
+                        if let Some(expected) = pol.expected_id(e).map(str::to_string) {
+                            if let Some(actual) = ident.hash(e) {
+                                if actual != expected {
+                                    id_changed = true;
+                                    if id_warned.insert(e.to_string()) {
+                                        eprintln!(
+                                            "pfsnitch: BINARY CHANGED {e}\n  approved {expected}\n  now      {actual}\n  its rules are being ignored until you approve it again"
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                let verdict = if id_changed {
-                    Verdict::Ask
-                } else {
-                    pol.decide(exe.as_deref(), f.dst, hostname.as_deref(), f.dport)
-                };
+                    let verdict = if id_changed {
+                        Verdict::Ask
+                    } else {
+                        pol.decide(exe.as_deref(), f.dst, hostname.as_deref(), f.dport)
+                    };
 
-                // What the log will call this. Ask becomes Learn in visibility,
-                // because nothing is being asked - we are writing the rule.
-                let mut label = format!("{verdict:?}");
+                    // What the log will call this. Ask becomes Learn in
+                    // visibility, because nothing is being asked - we are
+                    // writing the rule.
+                    let mut label = format!("{verdict:?}");
 
-                match verdict {
-                    Verdict::Allow => allow = true,
-                    Verdict::Deny => { allow = false; reject = true; }
-                    Verdict::Ask if mode.enforcing() => {
-                        allow = false; // hold it: the SYN will be retried
-                        let key = (exe.clone().unwrap_or_default(), f.dst);
-                        if asking.insert(key) {
-                            let host = names.name_for(&f.dst).unwrap_or("").to_string();
-                            spawn_prompt(
-                                prompt_bin.clone(),
-                                id_changed,
-                                tx.clone(),
-                                exe.clone(),
-                                owner.as_ref().map(|o| o.pid).unwrap_or(0),
-                                owner.as_ref().map(|o| o.command.clone()).unwrap_or_default(),
+                    match verdict {
+                        Verdict::Allow => allow = true,
+                        Verdict::Deny => { allow = false; reject = true; }
+                        Verdict::Ask if mode.enforcing() => {
+                            allow = false; // hold it: the SYN will be retried
+                            let key = (exe.clone().unwrap_or_default(), f.dst);
+                            if asking.insert(key) {
+                                let host = names.name_for(&f.dst).unwrap_or("").to_string();
+                                spawn_prompt(
+                                    prompt_bin.clone(),
+                                    id_changed,
+                                    tx.clone(),
+                                    exe.clone(),
+                                    owner.as_ref().map(|o| o.pid).unwrap_or(0),
+                                    owner.as_ref().map(|o| o.command.clone()).unwrap_or_default(),
+                                    f.dst,
+                                    f.dport,
+                                    host,
+                                );
+                            }
+                        }
+                        Verdict::Ask => {
+                            // Visibility learns instead of asking. The point of
+                            // this mode is to see everything the machine talks to
+                            // and end up with a rule set describing it, so a
+                            // dialog here would be noise: there is nothing to
+                            // decide when the packet is going to be reinjected
+                            // either way.
+                            allow = true;
+                            pol.record(
+                                policy_path,
+                                Answer::AllowConn,
+                                exe.as_deref(),
                                 f.dst,
+                                hostname.as_deref(),
                                 f.dport,
-                                host,
+                                policy::Origin::Learned,
                             );
+                            // We just wrote the file ourselves, so move our
+                            // watermark past that write. Otherwise the next tick
+                            // sees a changed mtime and re-reads a file we already
+                            // agree with - once per learned connection.
+                            pol_mtime = policy::mtime(policy_path);
+                            label = "Learn".to_string();
                         }
                     }
-                    Verdict::Ask => {
-                        // Visibility learns instead of asking. The point of this
-                        // mode is to see everything the machine talks to and end
-                        // up with a rule set describing it, so a dialog here
-                        // would be noise: there is nothing to decide when the
-                        // packet is going to be reinjected either way.
-                        //
-                        // Records a hostname when we saw the lookup and a bare
-                        // address otherwise, which is the same choice a user
-                        // clicking "Allow connection" would produce.
-                        allow = true;
-                        pol.record(
-                            policy_path,
-                            Answer::AllowConn,
-                            exe.as_deref(),
-                            f.dst,
-                            hostname.as_deref(),
-                            f.dport,
-                            policy::Origin::Learned,
-                        );
-                        // We just wrote the file ourselves, so move our
-                        // watermark past that write. Otherwise the next tick
-                        // sees a changed mtime and re-reads a file we already
-                        // agree with - once per learned connection.
-                        pol_mtime = policy::mtime(policy_path);
-                        label = "Learn".to_string();
+
+                    // Only a settled verdict is worth remembering. Caching an Ask
+                    // would freeze the flow in the state of not yet knowing.
+                    if matches!(verdict, Verdict::Allow | Verdict::Deny) {
+                        if decided.len() > 16_384 {
+                            decided.clear();
+                        }
+                        decided.insert(flow, verdict);
                     }
-                }
-                // DNS-over-HTTPS, which we cannot observe.
-                let host = names.name_for(&f.dst).unwrap_or("-");
 
-                // Note the contact. Spelled the way a rule spells it - hostname
-                // when we saw one, address otherwise - so `pfsnitch apps` can
-                // join these against rules without a second matching scheme
-                // that could disagree with the first.
-                if let Some(e) = exe.as_deref() {
-                    let dest = if host == "-" { f.dst.to_string() } else { host.to_string() };
-                    seen.touch(e, &dest);
-                }
+                    // DNS-over-HTTPS, which we cannot observe.
+                    let host = names.name_for(&f.dst).unwrap_or("-");
 
-                // Once per flow, not once per packet. pf diverts EVERY packet
-                // matching the rule - not just the first - so a UDP stream would
-                // otherwise write a log line per datagram. A QUIC video call
-                // would fill the disk describing a decision already made.
-                if logged.insert((f.proto, f.src, f.sport, f.dst, f.dport)) {
-                    println!(
-                        "{:<6} {}:{} -> {} ({}) :{}  {}",
-                        label,
-                        f.src, f.sport, f.dst, host, f.dport,
-                        owner.as_ref()
-                            .map(|o| format!("{} [{}] {}", o.command, o.pid, o.path))
-                            .unwrap_or_else(|| "<unattributed>".into()),
-                    );
+                    // Note the contact. Spelled the way a rule spells it -
+                    // hostname when we saw one, address otherwise - so
+                    // `pfsnitch apps` can join these against rules without a
+                    // second matching scheme that could disagree with the first.
+                    if let Some(e) = exe.as_deref() {
+                        let dest = if host == "-" { f.dst.to_string() } else { host.to_string() };
+                        seen.touch(e, &dest);
+                    }
+
+                    if logged.insert(flow) {
+                        println!(
+                            "{:<6} {}:{} -> {} ({}) :{}  {}",
+                            label,
+                            f.src, f.sport, f.dst, host, f.dport,
+                            owner.as_ref()
+                                .map(|o| format!("{} [{}] {}", o.command, o.pid, o.path))
+                                .unwrap_or_else(|| "<unattributed>".into()),
+                        );
+                    }
                 }
             }
         }

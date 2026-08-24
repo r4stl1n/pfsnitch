@@ -139,10 +139,17 @@ not just the connection setup. Measured on a 9 MB download over a ~35 Mbit/s
 link: 34-35 Mbit/s without pfsnitch, 27-31 Mbit/s with it, and 10,110
 diversions for the transfer.
 
-That is roughly 15 µs of CPU per packet, so a single core tops out somewhere
-near 800 Mbit/s. On a laptop the cost is real but small; on a fast link or a
-server it will limit throughput. See [docs/SAFETY.md](docs/SAFETY.md#what-this-costs)
-for why, and why the obvious fix does not work.
+That is roughly 15 µs of CPU per packet for TCP, so a single core tops out
+somewhere near 800 Mbit/s. On a laptop the cost is real but small; on a fast
+link or a server it will limit throughput.
+
+UDP costs more, because every datagram needs a verdict rather than just a
+reinjection. Verdicts are cached per flow - without that, one video stream pegged
+a core and the daemon dropped 99% of the traffic it was supposed to be judging.
+With it, a streaming rate costs about 0.5% CPU.
+
+See [docs/SAFETY.md](docs/SAFETY.md#what-this-costs) for the measurements, and
+for why the obvious fix to the TCP cost does not work.
 
 ## Nothing escapes before the daemon is up
 
