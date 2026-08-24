@@ -62,6 +62,15 @@ running daemon with pf off is a daemon enforcing nothing.
   accumulate deny rules for software no human ever judged.
 - **Policy is keyed on the executable path**, never the process name: a name is
   trivially spoofable and the kernel truncates it to 19 characters anyway.
+- **...and an approval pins that binary's hash.** A path is not an identity;
+  replacing the file would otherwise hand the replacement every rule the
+  original earned. If the hash later differs, those rules are ignored and the
+  connection falls back to asking.
+- **A settled deny is rejected, not dropped.** The application gets
+  `ECONNREFUSED` at once instead of a 75 second silence, because a hang reads as
+  a broken network rather than as a decision. A packet held while a prompt is
+  open is still dropped, since its retransmission is what carries the connection
+  until the user answers.
 
 ## Boot: nothing escapes before the daemon is up
 

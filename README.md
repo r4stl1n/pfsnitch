@@ -54,10 +54,11 @@ phones a metrics endpoint loses the metrics endpoint, not the network.
 
 | kind | matches |
 |---|---|
-| `allow-host-from` / `deny-host-from` | a hostname, **for one binary** |
-| `allow-dest-from` / `deny-dest-from` | one address, **for one binary** |
+| `allow-host-from` / `deny-host-from` | a hostname, **for one binary**, optionally one port |
+| `allow-dest-from` / `deny-dest-from` | one address, **for one binary**, optionally one port |
 | `allow-app` / `deny-app` | one binary, every destination |
 | `allow-host` / `deny-host` / `allow-dest` | any binary — for real infrastructure (a resolver, a gateway) |
+| `app-id` | pins the binary's sha256 at the moment it was approved |
 
 Hostname rules are preferred over addresses because they survive round-robin
 DNS: one rule covers every address a site answers on, instead of re-prompting
@@ -66,6 +67,33 @@ for each rotating CDN address.
 A scoped deny is the most specific rule there is, so it beats every broader
 allow — including `allow-app` for that same binary. Otherwise approving a host
 for one program would silently re-open it for one you had blocked.
+
+Rules carry an optional port, and an approval covers the port it was asked
+about - approving a browser's HTTPS access should not also hand it SSH. A rule
+without a port still means any port, so older policy files keep their meaning.
+
+```sh
+pfsnitch allow host github.com:443 --from /usr/local/bin/git
+```
+
+## A rule is pinned to the binary, not just its path
+
+Replace the file behind an approved path and the replacement would inherit every
+rule the original earned. So an approval records the binary's sha256, and if it
+later differs its rules are ignored and the connection falls back to asking -
+with the prompt saying so in red.
+
+FreeBSD binaries are generally unsigned, so a content hash stands in for the code
+signature Little Snitch uses.
+
+## Blocked means refused, not hung
+
+A settled deny synthesises a TCP reset, so the application gets
+`Connection refused` immediately rather than waiting out a 75 second timeout - a
+hang reads as a broken network, not as a decision.
+
+A connection held while a prompt is open is still dropped silently, because
+TCP's own retransmission is what carries it until you answer.
 
 ## Managing it
 
@@ -79,6 +107,9 @@ pfsnitch allow host github.com --from /usr/local/bin/git
 pfsnitch deny  host metrics.example.com --from /usr/local/bin/someapp
 pfsnitch rm    deny-host-from metrics.example.com /usr/local/bin/someapp
 ```
+
+Every rule also records when it was last used, so a rule list can be reviewed
+for things left over from months ago rather than only read.
 
 The policy file is plain text, keeps its comments, and is **re-read within a
 second of any change** — by the CLI, an editor, or a script. Nothing needs to

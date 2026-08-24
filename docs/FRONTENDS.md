@@ -44,15 +44,37 @@ own line is a complete rule. Hand-editing is an interface, not a workaround.
 | `deny-host-from`  | a hostname, **for one binary** | what *Block connection* writes |
 | `allow-dest-from` | one address, **for one binary** | used when no hostname was seen |
 | `deny-dest-from`  | one address, **for one binary** | as above |
-| `allow-app`       | one binary, every destination | |
-| `deny-app`        | one binary, every destination | the big hammer |
+| `allow-app`       | one binary, every destination and port | |
+| `deny-app`        | one binary, every destination and port | the big hammer |
 | `allow-host`      | a hostname, **any binary** | infrastructure: a resolver, a gateway |
 | `deny-host`       | a hostname, any binary | |
 | `allow-dest`      | one address, any binary | |
+| `app-id`          | pins a binary's sha256 | see *Binary identity* below |
 
 Hostname rules are preferred over addresses: one rule covers every address a
 site answers on, instead of re-prompting for each rotating CDN address.
 Wildcards are supported as `*.example.com`, in scoped and unscoped rules alike.
+
+### Ports
+
+Every host and address rule may name a port. A rule without one means **any
+port**, which is what a bare host has always meant - so a policy file written
+before ports existed keeps its meaning exactly.
+
+```
+allow-host-from github.com:443            /usr/local/bin/git   # just HTTPS
+allow-host-from github.com                /usr/local/bin/git   # any port
+allow-dest-from [2606:4700:4700::1111]:853 /usr/bin/drill      # DoT only
+allow-dest      1.1.1.1:53                                     # any binary, DNS only
+```
+
+IPv6 needs the bracket form when you want a port. A bare `2606:4700::1111` is
+full of colons and must not be read as a host and a port - so brackets are the
+only way to say which is which, exactly as in a URL.
+
+An approval made from a prompt covers **the port it was asked about**, not every
+port on that host. Approving a browser's HTTPS access should not also hand it
+SSH.
 
 Scoped rules are written **destination first**:
 
@@ -103,6 +125,33 @@ When *Allow connection* is answered for a connection that could not be
 attributed, pfsnitch falls back to an unscoped rule and marks it
 `# unattributed connection`, because it is broader than you asked for and should
 be easy to find on review.
+
+## Binary identity
+
+Policy keys on the executable path, because that is the only stable handle pf
+and libprocstat give us. But a path is not an identity: replace the file and the
+replacement inherits every rule the original earned.
+
+An approval therefore pins the binary's hash:
+
+```
+app-id 311447b0a7dd05377167c9ca97a36176...	/usr/local/bin/git	# identity when approved
+```
+
+If the binary later differs, **its rules are ignored** and the connection falls
+back to asking. The prompt says so in red, and receives `changed` as an optional
+7th argument - a backend written before that existed simply ignores it. An
+approval given while it says `changed` re-pins the new hash: you have just said
+the new binary is the one you meant.
+
+FreeBSD binaries are generally unsigned, so a content hash stands in for the code
+signature Little Snitch uses. Hashing is `sha256(1)` from base rather than a
+crypto crate, cached on (mtime, size) so a binary is hashed once and again only
+when it actually changes.
+
+Only explicit approvals pin an identity - never a rule learned in visibility
+mode. Pinning something nobody looked at would give the pin a weight it has not
+earned.
 
 ## Grouped by application
 
@@ -163,6 +212,11 @@ Point `prompt` in `policy.conf`, `$PFSNITCH_PROMPT`, or `pfsnitch_prompt` in
 | `block-conn` | deny **this destination to this binary** — writes `deny-host-from` / `deny-dest-from` |
 | `block-app`  | deny the binary everything — writes `deny-app` |
 | `timeout`    | drop the packet, **write nothing** |
+
+A settled deny is **rejected, not dropped**: the daemon synthesises a TCP RST so
+the application gets `ECONNREFUSED` immediately instead of waiting out a 75
+second timeout. A packet held while a prompt is still open is dropped silently,
+because its retransmission is what carries the connection until you answer.
 
 `timeout` deliberately persists no rule. Walking away from a prompt must not
 lock you out of an application, and an unattended machine must not accumulate
