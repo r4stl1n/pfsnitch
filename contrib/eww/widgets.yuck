@@ -134,7 +134,7 @@
                       :tooltip "binary details"
                       :onclick "~/.config/eww/scripts/pfsnitch-appinfo-show '${g.app}'" "")
               (label :class "cnt allow" :text "${g.allow}")
-              (label :class {g.deny > 0 ? "cnt deny" : "cnt deny zero"} :text "")
+              (label :class {g.deny > 0 ? "cnt deny" : "cnt deny zero"} :text "${g.deny}")
               ;; Not offered for the catch-all group: those rules belong to no
               ;; binary and are the machine's infrastructure - a resolver, a
               ;; gateway. "Forget them all" has no sane reading there.

@@ -45,3 +45,12 @@ still renders correctly, it just cannot alter anything.
 - Nerd-font glyphs do not survive being piped through a shell heredoc, and
   `perl -pi` with a `\x{...}` replacement re-encodes the *whole file*. Use `sed`
   with bytes from `printf`, under `LC_ALL=C`.
+
+## A trap worth naming
+
+Do not edit these files with `perl -pi -e 's/.../.../'`. Perl interprets the
+*replacement* side: a `${g.deny}` becomes a variable dereference and silently
+substitutes nothing, and a `\x{f00d}` re-encodes the entire file. Both have
+happened here, and both produced widgets that looked fine until someone noticed
+a missing number. Use `sed`, which does not interpolate, and pass glyph bytes
+in via `printf` under `LC_ALL=C`.
