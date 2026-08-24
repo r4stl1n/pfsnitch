@@ -128,3 +128,43 @@ Two limits worth knowing:
   made by someone over SSH raises a dialog on the *console* user's screen. That
   is the wrong person to be deciding. For a shared machine, set
   `pfsnitch_prompt_backend="deny"` or `"file"` and manage rules out of band.
+
+## UDP, and what it costs
+
+TCP is easy: a SYN is an unambiguous "starting a connection", it is one packet
+per connection, and it retransmits for 75 s — so holding it while the user
+decides is free and reliable.
+
+UDP has none of that, and pfsnitch originally diverted **only DNS**. Everything
+else — QUIC/HTTP3 on port 443 above all, plus NTP, mDNS, WireGuard — flowed
+without pfsnitch seeing a packet. For a per-application firewall that was a
+bypass, not a limitation: a browser speaking HTTP/3 reached the internet
+unobserved.
+
+`anchor.conf` now diverts outbound UDP generally. Three things are worth knowing
+before you rely on it:
+
+**Every packet is diverted, not just the first.** `keep state` stops later
+packets re-evaluating other rules; it does not exempt them from the divert
+action. Verified directly: a 30-datagram flow showed `9:2 pkts` on the pf state
+and produced exactly 9 diversions. So the cost scales with packet rate, not with
+flow count. The daemon logs each flow **once** rather than once per datagram —
+otherwise a video call would fill the disk describing a decision already made.
+
+**A dropped datagram is simply lost.** TCP is carried by SYN retransmission
+while a prompt is open. UDP has no equivalent: a protocol that sends once and
+gives up loses that datagram. Protocols that retry (DNS, QUIC) recover; some do
+not.
+
+**Everything that speaks UDP now prompts.** NTP, mDNS, and DHCP on other
+interfaces all become decisions.
+
+Comment the rule out of `anchor.conf` to return to TCP+DNS only. That is a
+smaller and more predictable tool — but QUIC then bypasses pfsnitch entirely,
+and it should be a choice you make knowingly rather than a default you inherit.
+
+### Still not covered
+
+ICMP, and any IP protocol that is neither TCP nor UDP, are not diverted. They
+are also not "an application connecting somewhere" in the sense this tool
+models, but a determined tunnel could use them.

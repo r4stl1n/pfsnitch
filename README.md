@@ -133,6 +133,10 @@ trivially spoofable and the kernel truncates it to 19 characters anyway.
 Hostnames come from snooping plaintext DNS replies. DNS-over-HTTPS is invisible
 to this, and such connections appear as bare addresses.
 
+Outbound UDP is diverted too, not just TCP - otherwise QUIC/HTTP3 would bypass
+the whole tool. UDP costs more than TCP does (every packet is diverted, and a
+dropped datagram is not retransmitted); see [docs/SAFETY.md](docs/SAFETY.md).
+
 ## Install
 
 FreeBSD, `pf` enabled. `libc` is the only build dependency — deliberately, for a

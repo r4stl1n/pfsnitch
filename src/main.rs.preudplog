@@ -332,9 +332,6 @@ fn run(fallback_mode: policy::Mode) {
     // One prompt per (binary, destination) in flight. Without this, a browser
     // opening thirty sockets to one host would raise thirty identical prompts.
     let mut asking: HashSet<(String, IpAddr)> = HashSet::new();
-    // Flows already written to the log. See the note at the println below.
-    let mut logged: HashSet<(u8, IpAddr, u16, IpAddr, u16)> = HashSet::new();
-    let mut logged_cleared = Instant::now();
     let mut buf = vec![0u8; 65_535];
 
     loop {
@@ -349,14 +346,6 @@ fn run(fallback_mode: policy::Mode) {
         // Pick up edits from any source - our own CLI, an editor, a frontend.
         // Polling the mtime beats a signal or a socket: nothing has to find the
         // daemon, so a frontend needs no privileges and no protocol.
-        // Forget logged flows periodically: bounds memory, and lets a
-        // long-running flow reappear in the log rather than vanishing after
-        // its first packet.
-        if logged_cleared.elapsed() >= Duration::from_secs(120) || logged.len() > 8192 {
-            logged.clear();
-            logged_cleared = Instant::now();
-        }
-
         if last_check.elapsed() >= Duration::from_secs(1) {
             last_check = Instant::now();
             let m = policy::mtime(policy_path);
@@ -458,20 +447,14 @@ fn run(fallback_mode: policy::Mode) {
                 // DNS-over-HTTPS, which we cannot observe.
                 let host = names.name_for(&f.dst).unwrap_or("-");
 
-                // Once per flow, not once per packet. pf diverts EVERY packet
-                // matching the rule - not just the first - so a UDP stream would
-                // otherwise write a log line per datagram. A QUIC video call
-                // would fill the disk describing a decision already made.
-                if logged.insert((f.proto, f.src, f.sport, f.dst, f.dport)) {
-                    println!(
-                        "{:<6} {}:{} -> {} ({}) :{}  {}",
-                        label,
-                        f.src, f.sport, f.dst, host, f.dport,
-                        owner.as_ref()
-                            .map(|o| format!("{} [{}] {}", o.command, o.pid, o.path))
-                            .unwrap_or_else(|| "<unattributed>".into()),
-                    );
-                }
+                println!(
+                    "{:<6} {}:{} -> {} ({}) :{}  {}",
+                    label,
+                    f.src, f.sport, f.dst, host, f.dport,
+                    owner.as_ref()
+                        .map(|o| format!("{} [{}] {}", o.command, o.pid, o.path))
+                        .unwrap_or_else(|| "<unattributed>".into()),
+                );
             }
         }
         // Observe mode never drops: that is the entire point of having it.
