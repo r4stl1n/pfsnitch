@@ -79,19 +79,22 @@ pub struct Policy {
     default: Option<Verdict>,
     allow_app: HashSet<String>,
     deny_app: HashSet<String>,
-    allow_host: HashSet<String>,
-    deny_host: HashSet<String>,
-    allow_dest: HashSet<IpAddr>,
+    // Host and address rules carry an optional port. None means any port, which
+    // is what a bare host means and what every rule written before ports
+    // existed still means - so old policy files keep their meaning exactly.
+    allow_host: HashSet<Target>,
+    deny_host: HashSet<Target>,
+    allow_dest: HashSet<(IpAddr, Option<u16>)>,
     /// Destinations denied to ONE binary, leaving it otherwise working.
     /// This is what "Block" produces: blocking a metrics endpoint should not
     /// take the whole application off the network.
     /// Destinations approved for ONE binary. This is what "Allow connection"
     /// writes when we know which binary asked, so approving a host for one
     /// program does not quietly open it for every other program too.
-    allow_host_from: HashSet<(String, String)>,
-    allow_dest_from: HashSet<(String, IpAddr)>,
-    deny_host_from: HashSet<(String, String)>,
-    deny_dest_from: HashSet<(String, IpAddr)>,
+    allow_host_from: HashSet<(String, String, Option<u16>)>,
+    allow_dest_from: HashSet<(String, IpAddr, Option<u16>)>,
+    deny_host_from: HashSet<(String, String, Option<u16>)>,
+    deny_dest_from: HashSet<(String, IpAddr, Option<u16>)>,
     /// Program used to ask the user. Configurable so that no particular
     /// desktop (or any desktop at all) is a requirement - see prompt_bin().
     prompt: Option<String>,
@@ -127,39 +130,42 @@ impl Policy {
                 }
                 "allow-app" => { p.allow_app.insert(v.to_string()); }
                 "deny-app" => { p.deny_app.insert(v.to_string()); }
-                "allow-host" => { p.allow_host.insert(v.to_lowercase()); }
-                "deny-host" => { p.deny_host.insert(v.to_lowercase()); }
+                "allow-host" => { let (h, pt) = split_target(v); p.allow_host.insert((h.to_lowercase(), pt)); }
+                "deny-host" => { let (h, pt) = split_target(v); p.deny_host.insert((h.to_lowercase(), pt)); }
                 "prompt" => { p.prompt = Some(v.to_string()); }
                 "mode" => match Mode::parse(v) {
                     Some(m) => p.mode = Some(m),
                     None => eprintln!("policy:{}: bad mode {v:?}", n + 1),
                 },
                 "allow-host-from" => match split_scoped(v) {
-                    Some((h, e)) => { p.allow_host_from.insert((e, h.to_lowercase())); }
+                    Some((h, e)) => { let (hh, pt) = split_target(&h); p.allow_host_from.insert((e, hh.to_lowercase(), pt)); }
                     None => eprintln!("policy:{}: want `allow-host-from <host> <binary>`", n + 1),
                 },
                 "allow-dest-from" => match split_scoped(v) {
-                    Some((a, e)) => match a.parse::<IpAddr>() {
-                        Ok(addr) => { p.allow_dest_from.insert((e, addr)); }
+                    Some((a, e)) => { let (aa, pt) = split_target(&a); match aa.parse::<IpAddr>() {
+                        Ok(addr) => { p.allow_dest_from.insert((e, addr, pt)); }
                         Err(_) => eprintln!("policy:{}: bad address {a:?}", n + 1),
-                    },
+                    } }
                     None => eprintln!("policy:{}: want `allow-dest-from <addr> <binary>`", n + 1),
                 },
                 "deny-host-from" => match split_scoped(v) {
-                    Some((h, e)) => { p.deny_host_from.insert((e, h.to_lowercase())); }
+                    Some((h, e)) => { let (hh, pt) = split_target(&h); p.deny_host_from.insert((e, hh.to_lowercase(), pt)); }
                     None => eprintln!("policy:{}: want `deny-host-from <host> <binary>`", n + 1),
                 },
                 "deny-dest-from" => match split_scoped(v) {
-                    Some((a, e)) => match a.parse::<IpAddr>() {
-                        Ok(addr) => { p.deny_dest_from.insert((e, addr)); }
+                    Some((a, e)) => { let (aa, pt) = split_target(&a); match aa.parse::<IpAddr>() {
+                        Ok(addr) => { p.deny_dest_from.insert((e, addr, pt)); }
                         Err(_) => eprintln!("policy:{}: bad address {a:?}", n + 1),
-                    },
+                    } }
                     None => eprintln!("policy:{}: want `deny-dest-from <addr> <binary>`", n + 1),
                 },
-                "allow-dest" => match v.parse::<IpAddr>() {
-                    Ok(a) => { p.allow_dest.insert(a); }
-                    Err(_) => eprintln!("policy:{}: bad address {v:?}", n + 1),
-                },
+                "allow-dest" => {
+                    let (a, pt) = split_target(v);
+                    match a.parse::<IpAddr>() {
+                        Ok(addr) => { p.allow_dest.insert((addr, pt)); }
+                        Err(_) => eprintln!("policy:{}: bad address {a:?}", n + 1),
+                    }
+                }
                 _ => eprintln!("policy:{}: unknown directive {k:?}", n + 1),
             }
         }
@@ -179,34 +185,71 @@ impl Policy {
         }
     }
 
-    /// Does any (binary, host-pattern) pair in this set cover exe+host?
-    fn scoped_host_hit(set: &HashSet<(String, String)>, exe: &str, host_lower: &str) -> bool {
-        set.iter().any(|(e, pat)| e == exe && Self::pattern_matches(pat, host_lower))
+    /// Does a rule's port constraint admit this destination port?
+    ///
+    /// A rule with no port means any port. That is what a bare host has always
+    /// meant, so every rule written before ports existed keeps its meaning.
+    fn port_ok(rule: Option<u16>, dport: u16) -> bool {
+        match rule {
+            None => true,
+            Some(p) => p == dport,
+        }
     }
 
-    fn host_matches(set: &HashSet<String>, host: &str) -> bool {
+    /// Does any (binary, host-pattern, port) rule cover this exe+host+port?
+    fn scoped_host_hit(
+        set: &HashSet<(String, String, Option<u16>)>,
+        exe: &str,
+        host_lower: &str,
+        dport: u16,
+    ) -> bool {
+        set.iter().any(|(e, pat, port)| {
+            e == exe && Self::port_ok(*port, dport) && Self::pattern_matches(pat, host_lower)
+        })
+    }
+
+    fn scoped_dest_hit(
+        set: &HashSet<(String, IpAddr, Option<u16>)>,
+        exe: &str,
+        dst: IpAddr,
+        dport: u16,
+    ) -> bool {
+        set.iter()
+            .any(|(e, a, port)| e == exe && *a == dst && Self::port_ok(*port, dport))
+    }
+
+    fn host_matches(set: &HashSet<Target>, host: &str, dport: u16) -> bool {
         let h = host.to_lowercase();
-        set.contains(&h) || set.iter().any(|rule| Self::pattern_matches(rule, &h))
+        set.iter()
+            .any(|(pat, port)| Self::port_ok(*port, dport) && Self::pattern_matches(pat, &h))
     }
 
-    /// Decide. Denials win over approvals: an explicitly blocked binary is not
-    /// rescued by some other application having opened up the destination.
-    pub fn decide(&self, exe: Option<&str>, dst: IpAddr, host: Option<&str>) -> Verdict {
+    fn dest_matches(set: &HashSet<(IpAddr, Option<u16>)>, dst: IpAddr, dport: u16) -> bool {
+        set.iter().any(|(a, port)| *a == dst && Self::port_ok(*port, dport))
+    }
+
+    pub fn decide(
+        &self,
+        exe: Option<&str>,
+        dst: IpAddr,
+        host: Option<&str>,
+        dport: u16,
+    ) -> Verdict {
         // Most specific first: a destination denied to THIS binary outranks any
         // broader allow, otherwise approving example.com for one app would
         // silently re-open it for an app you had blocked.
         if let Some(e) = exe {
-            if self.deny_dest_from.contains(&(e.to_string(), dst)) {
+            if Self::scoped_dest_hit(&self.deny_dest_from, e, dst, dport) {
                 return Verdict::Deny;
             }
             if let Some(h) = host {
-                if Self::scoped_host_hit(&self.deny_host_from, e, &h.to_lowercase()) {
+                if Self::scoped_host_hit(&self.deny_host_from, e, &h.to_lowercase(), dport) {
                     return Verdict::Deny;
                 }
             }
         }
         if let Some(h) = host {
-            if Self::host_matches(&self.deny_host, h) {
+            if Self::host_matches(&self.deny_host, h, dport) {
                 return Verdict::Deny;
             }
         }
@@ -217,11 +260,11 @@ impl Policy {
             // Approved for THIS binary. Checked before the global allow sets so
             // that a per-app approval is what actually matches, rather than
             // being shadowed by a broad rule that happens to cover it.
-            if self.allow_dest_from.contains(&(e.to_string(), dst)) {
+            if Self::scoped_dest_hit(&self.allow_dest_from, e, dst, dport) {
                 return Verdict::Allow;
             }
             if let Some(h) = host {
-                if Self::scoped_host_hit(&self.allow_host_from, e, &h.to_lowercase()) {
+                if Self::scoped_host_hit(&self.allow_host_from, e, &h.to_lowercase(), dport) {
                     return Verdict::Allow;
                 }
             }
@@ -230,11 +273,11 @@ impl Policy {
             }
         }
         if let Some(h) = host {
-            if Self::host_matches(&self.allow_host, h) {
+            if Self::host_matches(&self.allow_host, h, dport) {
                 return Verdict::Allow;
             }
         }
-        if self.allow_dest.contains(&dst) {
+        if Self::dest_matches(&self.allow_dest, dst, dport) {
             return Verdict::Allow;
         }
         self.default.unwrap_or(Verdict::Ask)
@@ -243,6 +286,7 @@ impl Policy {
     /// Persist a decision. Appends, so hand-written comments and ordering
     /// survive. The originating binary is recorded as a comment: reviewing a
     /// bare address months later tells you nothing about why it is there.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         path: &Path,
@@ -250,27 +294,35 @@ impl Policy {
         exe: Option<&str>,
         dst: IpAddr,
         host: Option<&str>,
+        dport: u16,
         origin: Origin,
     ) {
         let who = exe.unwrap_or("unknown");
+        // An approval covers the port it was asked about, not every port on that
+        // host. Approving a browser's HTTPS access should not also hand it SSH.
+        let port = Some(dport);
         let line = match ans {
             Answer::AllowConn => match (exe, host) {
                 // Scope to the binary whenever we know it. Approving a host for
                 // one program should not quietly open it for every other
-                // program on the machine - that is the whole difference between
-                // "this app may talk to it" and "this machine may talk to it".
+                // program on the machine.
                 //
                 // Prefer the NAME over the address so one rule covers every
                 // address the site answers on, instead of one rule per rotating
                 // CDN address.
                 (Some(e), Some(h)) if !h.is_empty() && h != "-" => {
-                    self.allow_host_from.insert((e.to_string(), h.to_lowercase()));
-                    format!("allow-host-from {h}\t{e}\t# {} for this app", origin.adjective())
+                    self.allow_host_from.insert((e.to_string(), h.to_lowercase(), port));
+                    format!(
+                        "allow-host-from {}\t{e}\t# {} for this app",
+                        join_target(h, port),
+                        origin.adjective()
+                    )
                 }
                 (Some(e), _) => {
-                    self.allow_dest_from.insert((e.to_string(), dst));
+                    self.allow_dest_from.insert((e.to_string(), dst, port));
                     format!(
-                        "allow-dest-from {dst}\t{e}\t# no hostname seen; {} for this app",
+                        "allow-dest-from {}\t{e}\t# no hostname seen; {} for this app",
+                        join_target(&dst.to_string(), port),
                         origin.adjective()
                     )
                 }
@@ -279,13 +331,18 @@ impl Policy {
                 // a machine-wide rule and label it, because it is broader than
                 // the user asked for and should be easy to spot on review.
                 (None, Some(h)) if !h.is_empty() && h != "-" => {
-                    self.allow_host.insert(h.to_lowercase());
-                    format!("allow-host {h}\t# {}; unattributed connection", origin.adjective())
+                    self.allow_host.insert((h.to_lowercase(), port));
+                    format!(
+                        "allow-host {}\t# {}; unattributed connection",
+                        join_target(h, port),
+                        origin.adjective()
+                    )
                 }
                 (None, _) => {
-                    self.allow_dest.insert(dst);
+                    self.allow_dest.insert((dst, port));
                     format!(
-                        "allow-dest {dst}\t# {}; unattributed, no hostname seen",
+                        "allow-dest {}\t# {}; unattributed, no hostname seen",
+                        join_target(&dst.to_string(), port),
                         origin.adjective()
                     )
                 }
@@ -303,12 +360,18 @@ impl Policy {
                 // pinning one IP the app will stop using tomorrow.
                 Some(e) => match host {
                     Some(h) if !h.is_empty() && h != "-" => {
-                        self.deny_host_from.insert((e.to_string(), h.to_lowercase()));
-                        format!("deny-host-from {h}\t{e}\t# blocked for this app only")
+                        self.deny_host_from.insert((e.to_string(), h.to_lowercase(), port));
+                        format!(
+                            "deny-host-from {}\t{e}\t# blocked for this app only",
+                            join_target(h, port)
+                        )
                     }
                     _ => {
-                        self.deny_dest_from.insert((e.to_string(), dst));
-                        format!("deny-dest-from {dst}\t{e}\t# no hostname seen; blocked for this app only")
+                        self.deny_dest_from.insert((e.to_string(), dst, port));
+                        format!(
+                            "deny-dest-from {}\t{e}\t# no hostname seen; blocked for this app only",
+                            join_target(&dst.to_string(), port)
+                        )
                     }
                 },
                 None => return,
@@ -322,6 +385,7 @@ impl Policy {
             },
             Answer::Timeout => return,
         };
+        let _ = who;
 
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "{line}");
@@ -385,22 +449,34 @@ fn split_comment(raw: &str) -> (&str, Option<String>) {
 /// "remove" will miss rules that "add" would consider duplicates.
 fn normalise(kind: &str, value: &str) -> String {
     match kind {
-        "allow-host" | "deny-host" => value.to_lowercase(),
+        "allow-host" | "deny-host" => {
+            let (h, p) = split_target(value);
+            join_target(&h.to_lowercase(), p)
+        }
         "allow-host-from" | "deny-host-from" => match split_scoped(value) {
-            Some((h, e)) => format!("{} {e}", h.to_lowercase()),
+            Some((h, e)) => {
+                let (hh, p) = split_target(&h);
+                format!("{} {e}", join_target(&hh.to_lowercase(), p))
+            }
             None => value.to_string(),
         },
         "allow-dest-from" | "deny-dest-from" => match split_scoped(value) {
-            Some((a, e)) => match a.parse::<IpAddr>() {
-                Ok(addr) => format!("{addr} {e}"),
-                Err(_) => value.to_string(),
-            },
+            Some((a, e)) => {
+                let (aa, p) = split_target(&a);
+                match aa.parse::<IpAddr>() {
+                    Ok(addr) => format!("{} {e}", join_target(&addr.to_string(), p)),
+                    Err(_) => value.to_string(),
+                }
+            }
             None => value.to_string(),
         },
-        "allow-dest" => value
-            .parse::<IpAddr>()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| value.to_string()),
+        "allow-dest" => {
+            let (a, p) = split_target(value);
+            match a.parse::<IpAddr>() {
+                Ok(addr) => join_target(&addr.to_string(), p),
+                Err(_) => value.to_string(),
+            }
+        }
         _ => value.to_string(),
     }
 }
@@ -445,7 +521,7 @@ pub fn add_rule(path: &Path, kind: &str, value: &str, note: Option<&str>) -> io:
     }
     if matches!(kind, "allow-host-from" | "allow-dest-from" | "deny-host-from" | "deny-dest-from") {
         match split_scoped(value) {
-            Some((d, _)) if kind.ends_with("dest-from") && d.parse::<IpAddr>().is_err() => {
+            Some((d, _)) if kind.ends_with("dest-from") && split_target(&d).0.parse::<IpAddr>().is_err() => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("{d:?} is not an IP address - use the -host-from form for names"),
@@ -460,7 +536,7 @@ pub fn add_rule(path: &Path, kind: &str, value: &str, note: Option<&str>) -> io:
             }
         }
     }
-    if kind == "allow-dest" && value.parse::<IpAddr>().is_err() {
+    if kind == "allow-dest" && split_target(value).0.parse::<IpAddr>().is_err() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{value:?} is not an IP address - use allow-host for names"),
@@ -674,17 +750,17 @@ mod tests {
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
         assert_eq!(
-            pol.decide(Some(APP), dst, Some("metrics.example.com")),
+            pol.decide(Some(APP), dst, Some("metrics.example.com"), 443),
             Verdict::Deny,
             "the blocked endpoint must be denied to this app"
         );
         assert_eq!(
-            pol.decide(Some(APP), dst, Some("api.example.com")),
+            pol.decide(Some(APP), dst, Some("api.example.com"), 443),
             Verdict::Allow,
             "the app must keep working everywhere else - the whole point"
         );
         assert_eq!(
-            pol.decide(Some(OTHER), dst, Some("metrics.example.com")),
+            pol.decide(Some(OTHER), dst, Some("metrics.example.com"), 443),
             Verdict::Allow,
             "the block is scoped to one binary, not the host globally"
         );
@@ -701,12 +777,12 @@ mod tests {
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
         assert_eq!(
-            pol.decide(Some(APP), dst, Some("metrics.example.com")),
+            pol.decide(Some(APP), dst, Some("metrics.example.com"), 443),
             Verdict::Deny,
             "specific beats general, or the block silently evaporates"
         );
         assert_eq!(
-            pol.decide(Some(OTHER), dst, Some("metrics.example.com")),
+            pol.decide(Some(OTHER), dst, Some("metrics.example.com"), 443),
             Verdict::Allow
         );
         let _ = fs::remove_file(path);
@@ -720,11 +796,11 @@ mod tests {
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
         assert_eq!(
-            pol.decide(Some(APP), dst, Some("metrics.example.com")),
+            pol.decide(Some(APP), dst, Some("metrics.example.com"), 443),
             Verdict::Deny,
             "approving an app wholesale must not resurrect a destination you blocked"
         );
-        assert_eq!(pol.decide(Some(APP), dst, Some("cdn.example.com")), Verdict::Allow);
+        assert_eq!(pol.decide(Some(APP), dst, Some("cdn.example.com"), 443), Verdict::Allow);
         let _ = fs::remove_file(path);
     }
 
@@ -736,9 +812,9 @@ mod tests {
         );
         let blocked = "203.0.113.9".parse::<IpAddr>().unwrap();
         let other = "203.0.113.10".parse::<IpAddr>().unwrap();
-        assert_eq!(pol.decide(Some(APP), blocked, None), Verdict::Deny);
-        assert_eq!(pol.decide(Some(APP), other, None), Verdict::Allow);
-        assert_eq!(pol.decide(Some(OTHER), blocked, None), Verdict::Allow);
+        assert_eq!(pol.decide(Some(APP), blocked, None, 443), Verdict::Deny);
+        assert_eq!(pol.decide(Some(APP), other, None, 443), Verdict::Allow);
+        assert_eq!(pol.decide(Some(OTHER), blocked, None, 443), Verdict::Allow);
         let _ = fs::remove_file(path);
     }
 
@@ -749,9 +825,9 @@ mod tests {
             "default allow\ndeny-host-from *.telemetry.example.com /usr/local/bin/someapp\n",
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
-        assert_eq!(pol.decide(Some(APP), dst, Some("eu.telemetry.example.com")), Verdict::Deny);
-        assert_eq!(pol.decide(Some(APP), dst, Some("telemetry.example.com")), Verdict::Deny);
-        assert_eq!(pol.decide(Some(APP), dst, Some("example.com")), Verdict::Allow);
+        assert_eq!(pol.decide(Some(APP), dst, Some("eu.telemetry.example.com"), 443), Verdict::Deny);
+        assert_eq!(pol.decide(Some(APP), dst, Some("telemetry.example.com"), 443), Verdict::Deny);
+        assert_eq!(pol.decide(Some(APP), dst, Some("example.com"), 443), Verdict::Allow);
         let _ = fs::remove_file(path);
     }
 
@@ -765,9 +841,70 @@ mod tests {
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
         assert_eq!(
-            pol.decide(Some("/opt/My App/bin/app"), dst, Some("metrics.example.com")),
+            pol.decide(Some("/opt/My App/bin/app"), dst, Some("metrics.example.com"), 443),
             Verdict::Deny
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_port_scoped_rule_does_not_open_other_ports() {
+        // The gap this whole feature exists to close: approving HTTPS to a host
+        // must not also hand the app SSH to it.
+        let (pol, path) = load_from(
+            "portscope",
+            "default ask\nallow-host-from example.com:443 /usr/local/bin/someapp\n",
+        );
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), dst, Some("example.com"), 443), Verdict::Allow);
+        assert_eq!(
+            pol.decide(Some(APP), dst, Some("example.com"), 22),
+            Verdict::Ask,
+            "a different port on the same host is a different decision"
+        );
+        assert_eq!(pol.decide(Some(APP), dst, Some("example.com"), 80), Verdict::Ask);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_rule_without_a_port_still_means_any_port() {
+        // Every rule written before ports existed must keep its meaning.
+        let (pol, path) = load_from(
+            "portless",
+            "default ask\nallow-host-from example.com /usr/local/bin/someapp\n",
+        );
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        for p in [22u16, 80, 443, 8080] {
+            assert_eq!(
+                pol.decide(Some(APP), dst, Some("example.com"), p),
+                Verdict::Allow,
+                "bare host rule should still cover port {p}"
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_port_scoped_deny_only_blocks_that_port() {
+        let (pol, path) = load_from(
+            "denyport",
+            "default allow\ndeny-host-from example.com:443 /usr/local/bin/someapp\n",
+        );
+        let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), dst, Some("example.com"), 443), Verdict::Deny);
+        assert_eq!(pol.decide(Some(APP), dst, Some("example.com"), 80), Verdict::Allow);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ipv6_literal_with_a_port_is_parsed_and_matched() {
+        let (pol, path) = load_from(
+            "v6port",
+            "default ask\nallow-dest-from [2606:4700:4700::1111]:853 /usr/local/bin/someapp\n",
+        );
+        let v6 = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
+        assert_eq!(pol.decide(Some(APP), v6, None, 853), Verdict::Allow);
+        assert_eq!(pol.decide(Some(APP), v6, None, 443), Verdict::Ask);
         let _ = fs::remove_file(path);
     }
 
@@ -779,9 +916,9 @@ mod tests {
             "default ask\nallow-host-from api.example.com /usr/local/bin/someapp\n",
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
-        assert_eq!(pol.decide(Some(APP), dst, Some("api.example.com")), Verdict::Allow);
+        assert_eq!(pol.decide(Some(APP), dst, Some("api.example.com"), 443), Verdict::Allow);
         assert_eq!(
-            pol.decide(Some(OTHER), dst, Some("api.example.com")),
+            pol.decide(Some(OTHER), dst, Some("api.example.com"), 443),
             Verdict::Ask,
             "a different binary must still be asked about the same host"
         );
@@ -795,8 +932,8 @@ mod tests {
             "default ask\nallow-host-from api.example.com /usr/local/bin/someapp\ndeny-host-from api.example.com /usr/local/bin/otherapp\n",
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
-        assert_eq!(pol.decide(Some(APP), dst, Some("api.example.com")), Verdict::Allow);
-        assert_eq!(pol.decide(Some(OTHER), dst, Some("api.example.com")), Verdict::Deny);
+        assert_eq!(pol.decide(Some(APP), dst, Some("api.example.com"), 443), Verdict::Allow);
+        assert_eq!(pol.decide(Some(OTHER), dst, Some("api.example.com"), 443), Verdict::Deny);
         let _ = fs::remove_file(path);
     }
 
@@ -809,7 +946,7 @@ mod tests {
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
         assert_eq!(
-            pol.decide(Some(APP), dst, Some("api.example.com")),
+            pol.decide(Some(APP), dst, Some("api.example.com"), 443),
             Verdict::Deny,
             "deny must win when both are present, never allow"
         );
@@ -824,9 +961,9 @@ mod tests {
             "default ask\nallow-host dns.example.com\n",
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
-        assert_eq!(pol.decide(Some(APP), dst, Some("dns.example.com")), Verdict::Allow);
-        assert_eq!(pol.decide(Some(OTHER), dst, Some("dns.example.com")), Verdict::Allow);
-        assert_eq!(pol.decide(None, dst, Some("dns.example.com")), Verdict::Allow);
+        assert_eq!(pol.decide(Some(APP), dst, Some("dns.example.com"), 443), Verdict::Allow);
+        assert_eq!(pol.decide(Some(OTHER), dst, Some("dns.example.com"), 443), Verdict::Allow);
+        assert_eq!(pol.decide(None, dst, Some("dns.example.com"), 443), Verdict::Allow);
         let _ = fs::remove_file(path);
     }
 
@@ -840,10 +977,123 @@ mod tests {
         );
         let dst = "203.0.113.9".parse::<IpAddr>().unwrap();
         assert_eq!(
-            pol.decide(None, dst, Some("api.example.com")),
+            pol.decide(None, dst, Some("api.example.com"), 443),
             Verdict::Ask,
             "fail closed: an unidentified process gets no benefit from another app rule"
         );
         let _ = fs::remove_file(path);
+    }
+}
+
+/// A destination as written in a rule: a name or address, and an optional port.
+///
+/// `None` for the port means "any port", which is what a bare host means and
+/// what every rule written before ports existed still means.
+pub type Target = (String, Option<u16>);
+
+/// Split "host", "host:port", or "[v6addr]:port" into its parts.
+///
+/// IPv6 is why this is not a one-line split: an address is full of colons, so a
+/// bare `2606:4700::1111` must not be read as host `2606` port nothing-sensible.
+/// The rule is the same one URLs use - brackets when you want a port with a v6
+/// literal - and anything that parses as a bare address is taken whole.
+pub fn split_target(s: &str) -> Target {
+    let s = s.trim();
+
+    // [2606:4700::1111]:443  or  [2606:4700::1111]
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(close) = rest.find(']') {
+            let host = &rest[..close];
+            let after = &rest[close + 1..];
+            let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (host.to_string(), port);
+        }
+    }
+
+    // A bare IPv6 literal has more than one colon and no brackets: take it whole.
+    if s.parse::<std::net::Ipv6Addr>().is_ok() {
+        return (s.to_string(), None);
+    }
+
+    // host:port, but only if what follows the LAST colon is really a port.
+    if let Some(i) = s.rfind(':') {
+        if let Ok(p) = s[i + 1..].parse::<u16>() {
+            // Guard against a v6 address we failed to parse above.
+            if s[..i].matches(':').count() == 0 {
+                return (s[..i].to_string(), Some(p));
+            }
+        }
+    }
+
+    (s.to_string(), None)
+}
+
+/// Render a target back the way a rule file spells it.
+pub fn join_target(host: &str, port: Option<u16>) -> String {
+    match port {
+        None => host.to_string(),
+        Some(p) if host.parse::<std::net::Ipv6Addr>().is_ok() => format!("[{host}]:{p}"),
+        Some(p) => format!("{host}:{p}"),
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn plain_hostname_means_any_port() {
+        assert_eq!(split_target("example.com"), ("example.com".into(), None));
+    }
+
+    #[test]
+    fn hostname_with_port() {
+        assert_eq!(split_target("example.com:443"), ("example.com".into(), Some(443)));
+    }
+
+    #[test]
+    fn bare_ipv6_is_not_mistaken_for_a_port() {
+        // The whole reason this needs care: 1111 is not a port here.
+        assert_eq!(
+            split_target("2606:4700:4700::1111"),
+            ("2606:4700:4700::1111".into(), None)
+        );
+    }
+
+    #[test]
+    fn bracketed_ipv6_with_port() {
+        assert_eq!(
+            split_target("[2606:4700:4700::1111]:853"),
+            ("2606:4700:4700::1111".into(), Some(853))
+        );
+    }
+
+    #[test]
+    fn bracketed_ipv6_without_port() {
+        assert_eq!(
+            split_target("[2606:4700:4700::1111]"),
+            ("2606:4700:4700::1111".into(), None)
+        );
+    }
+
+    #[test]
+    fn ipv4_with_and_without_port() {
+        assert_eq!(split_target("1.1.1.1"), ("1.1.1.1".into(), None));
+        assert_eq!(split_target("1.1.1.1:53"), ("1.1.1.1".into(), Some(53)));
+    }
+
+    #[test]
+    fn a_port_that_is_not_a_number_stays_part_of_the_name() {
+        // "example.com:https" is not something we accept as a port, and quietly
+        // dropping the suffix would silently widen the rule.
+        assert_eq!(split_target("example.com:https"), ("example.com:https".into(), None));
+    }
+
+    #[test]
+    fn round_trips() {
+        for s in ["example.com", "example.com:443", "1.1.1.1:53", "[2606:4700::1111]:853"] {
+            let (h, p) = split_target(s);
+            assert_eq!(join_target(&h, p), s, "round trip failed for {s}");
+        }
     }
 }

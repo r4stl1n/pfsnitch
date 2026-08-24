@@ -291,6 +291,9 @@ struct Pending {
     host: Option<String>,
     exe: Option<String>,
     dst: IpAddr,
+    // Carried through the prompt so the recorded rule names the port that was
+    // actually asked about, not whichever one happens to come back first.
+    dport: u16,
 }
 
 fn run(fallback_mode: policy::Mode) {
@@ -342,7 +345,7 @@ fn run(fallback_mode: policy::Mode) {
         while let Ok((ans, p)) = rx.try_recv() {
             let key = (p.exe.clone().unwrap_or_default(), p.dst);
             asking.remove(&key);
-            pol.record(policy_path, ans, p.exe.as_deref(), p.dst, p.host.as_deref(), policy::Origin::Approved);
+            pol.record(policy_path, ans, p.exe.as_deref(), p.dst, p.host.as_deref(), p.dport, policy::Origin::Approved);
             eprintln!("  decision: {:?} for {} -> {}", ans, p.exe.as_deref().unwrap_or("?"), p.dst);
         }
 
@@ -402,7 +405,7 @@ fn run(fallback_mode: policy::Mode) {
                 let owner = res.owner(&t);
                 let exe = owner.as_ref().map(|o| o.path.clone());
                 let hostname = names.name_for(&f.dst).map(|s| s.to_string());
-                let verdict = pol.decide(exe.as_deref(), f.dst, hostname.as_deref());
+                let verdict = pol.decide(exe.as_deref(), f.dst, hostname.as_deref(), f.dport);
 
                 // What the log will call this. Ask becomes Learn in visibility,
                 // because nothing is being asked - we are writing the rule.
@@ -445,6 +448,7 @@ fn run(fallback_mode: policy::Mode) {
                             exe.as_deref(),
                             f.dst,
                             hostname.as_deref(),
+                            f.dport,
                             policy::Origin::Learned,
                         );
                         // We just wrote the file ourselves, so move our
@@ -514,7 +518,7 @@ fn spawn_prompt(
                 Answer::Timeout
             }
         };
-        let _ = tx.send((ans, Pending { exe, dst, host: if host2.is_empty() { None } else { Some(host2) } }));
+        let _ = tx.send((ans, Pending { exe, dst, dport, host: if host2.is_empty() { None } else { Some(host2) } }));
     });
 }
 
