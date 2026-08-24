@@ -290,3 +290,29 @@ standing permission attached to a path, so what matters is:
 `kind` is `binary`, or `global` for the catch-all group (which has no path).
 When `exists` is false, only `path`, `name`, `kind` and `exists` are present —
 a frontend must not assume the rest.
+
+## When a rule was last used
+
+`pfsnitch apps` reports `last_seen` (unix seconds, or `null`) and a short
+`last_seen_ago` for every rule and every application:
+
+```json
+{"kind":"allow-host-from","dest":"github.com","effect":"allow",
+ "last_seen":1787533666,"last_seen_ago":"40s ago", ...}
+```
+
+This is deliberately **not** traffic accounting. Only the first packet of a TCP
+connection ever reaches userspace — the rest matches pf state — so byte counts
+would be UDP-only and quietly misleading about everything else. A timestamp is
+something we can observe for every protocol, and it answers the question people
+actually ask of a rule list: is this still in use, or left over from something I
+did months ago?
+
+The daemon keeps the table at `/var/run/pfsnitch/lastseen` (`<unixtime>` TAB
+`<destination>` TAB `<binary>`), rewritten at most once every 10 seconds because
+this sits on the packet path. It is **seeded from that file at startup** — a
+restart that reset every timestamp to "never" would be worse than recording
+nothing, because it would look like real data.
+
+An unscoped rule is not owned by any binary, so its timestamp is the most recent
+time *any* binary used that destination.

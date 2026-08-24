@@ -15,6 +15,7 @@ mod divert;
 mod identity;
 mod policy;
 mod procinfo;
+mod seen;
 
 use policy::{Answer, Verdict};
 use std::collections::{HashMap, HashSet};
@@ -333,6 +334,7 @@ fn run(fallback_mode: policy::Mode) {
 
     let mut res = procinfo::Resolver::new();
     let mut ident = identity::Identity::new();
+    let mut seen = seen::Seen::new();
     // Binaries already reported as changed, so the warning is loud once rather
     // than once per retransmitted packet.
     let mut id_warned: HashSet<String> = HashSet::new();
@@ -371,6 +373,9 @@ fn run(fallback_mode: policy::Mode) {
         // Forget logged flows periodically: bounds memory, and lets a
         // long-running flow reappear in the log rather than vanishing after
         // its first packet.
+        // Rate-limited inside; this is just the tick that lets it happen.
+        seen.flush(Duration::from_secs(10));
+
         if logged_cleared.elapsed() >= Duration::from_secs(120) || logged.len() > 8192 {
             logged.clear();
             logged_cleared = Instant::now();
@@ -506,6 +511,15 @@ fn run(fallback_mode: policy::Mode) {
                 }
                 // DNS-over-HTTPS, which we cannot observe.
                 let host = names.name_for(&f.dst).unwrap_or("-");
+
+                // Note the contact. Spelled the way a rule spells it - hostname
+                // when we saw one, address otherwise - so `pfsnitch apps` can
+                // join these against rules without a second matching scheme
+                // that could disagree with the first.
+                if let Some(e) = exe.as_deref() {
+                    let dest = if host == "-" { f.dst.to_string() } else { host.to_string() };
+                    seen.touch(e, &dest);
+                }
 
                 // Once per flow, not once per packet. pf diverts EVERY packet
                 // matching the rule - not just the first - so a UDP stream would
@@ -653,6 +667,9 @@ fn split_rule(kind: &str, value: &str) -> Split {
 fn cmd_apps(args: &[String]) {
     let path = Path::new(POLICY_PATH);
     let rs = policy::rules(path);
+    // Written by the daemon; absent if it has never run. A missing table means
+    // "never", not an error.
+    let last = seen::load();
 
     // Preserve first-seen order within a group, but sort the groups themselves,
     // so the list does not reshuffle every time a rule is added.
@@ -673,6 +690,30 @@ fn cmd_apps(args: &[String]) {
         (a.is_empty(), base)
     });
 
+    // A rule names a destination and possibly a port; the daemon records only
+    // the destination, so strip the port before joining. An app-wide rule has
+    // no single destination, so it takes the most recent of anything that
+    // binary did.
+    let rule_seen = |app: &str, s: &Split| -> Option<u64> {
+        // An unscoped rule is not owned by any binary, so the useful answer is
+        // the most recent time ANY binary used that destination. Reporting
+        // "never" for a rule that is plainly in use would be worse than useless.
+        if app.is_empty() {
+            let (host, _) = policy::split_target(&s.dest);
+            let h = host.to_lowercase();
+            return last.iter().filter(|((_, d), _)| *d == h).map(|(_, t)| *t).max();
+        }
+        if s.dest == "all destinations" {
+            return last
+                .iter()
+                .filter(|((e, _), _)| e == app)
+                .map(|(_, t)| *t)
+                .max();
+        }
+        let (host, _) = policy::split_target(&s.dest);
+        last.get(&(app.to_string(), host.to_lowercase())).copied()
+    };
+
     let json = args.iter().any(|a| a == "--json");
     if !json {
         for app in &order {
@@ -680,9 +721,23 @@ fn cmd_apps(args: &[String]) {
             let label = if app.is_empty() { "(any application)" } else { app.as_str() };
             let allow = rules.iter().filter(|(_, s)| s.effect == "allow").count();
             let deny = rules.len() - allow;
-            println!("{label}  [{allow} allow, {deny} deny]");
+            // For the catch-all group, the most recent of the destinations it
+            // actually covers - otherwise the header reads "never" above rules
+            // that plainly are not.
+            let app_last = if app.is_empty() {
+                rules.iter().filter_map(|(_, s)| rule_seen(app, s)).max()
+            } else {
+                last.iter().filter(|((e, _), _)| e == app).map(|(_, t)| *t).max()
+            };
+            println!("{label}  [{allow} allow, {deny} deny]  last: {}", seen::ago(app_last));
             for (r, s) in rules {
-                println!("    {:<5} {:<44} {}", s.effect, s.dest, r.kind);
+                println!(
+                    "    {:<5} {:<40} {:<10} {}",
+                    s.effect,
+                    s.dest,
+                    seen::ago(rule_seen(app, s)),
+                    r.kind
+                );
             }
         }
         if order.is_empty() {
@@ -713,19 +768,32 @@ fn cmd_apps(args: &[String]) {
         println!("    \"dir\":\"{}\",", json_escape(&dir));
         println!("    \"dir_short\":\"{}\",", json_escape(&short_dir(&dir, 15)));
         println!("    \"name\":\"{}\",", json_escape(&name));
+        let app_last = if app.is_empty() {
+            rules.iter().filter_map(|(_, s)| rule_seen(app, s)).max()
+        } else {
+            last.iter().filter(|((e, _), _)| e == app).map(|(_, t)| *t).max()
+        };
         println!("    \"allow\":{allow},\"deny\":{deny},\"total\":{},", rules.len());
+        println!(
+            "    \"last_seen\":{},\"last_seen_ago\":\"{}\",",
+            app_last.map(|t| t.to_string()).unwrap_or_else(|| "null".into()),
+            json_escape(&seen::ago(app_last))
+        );
         println!("    \"rules\":[");
         for (j, (r, s)) in rules.iter().enumerate() {
             let comment = match &r.comment {
                 Some(c) => format!("\"{}\"", json_escape(c)),
                 None => "null".to_string(),
             };
+            let ls = rule_seen(app, s);
             println!(
-                "      {{\"kind\":\"{}\",\"value\":\"{}\",\"dest\":\"{}\",\"effect\":\"{}\",\"comment\":{}}}{}",
+                "      {{\"kind\":\"{}\",\"value\":\"{}\",\"dest\":\"{}\",\"effect\":\"{}\",\"last_seen\":{},\"last_seen_ago\":\"{}\",\"comment\":{}}}{}",
                 json_escape(&r.kind),
                 json_escape(&r.value),
                 json_escape(&s.dest),
                 s.effect,
+                ls.map(|t| t.to_string()).unwrap_or_else(|| "null".into()),
+                json_escape(&seen::ago(ls)),
                 comment,
                 if j + 1 == rules.len() { "" } else { "," }
             );

@@ -123,7 +123,9 @@
                     (label :class "appdir" :text {g.dir_short} :halign "start")
                     (label :class {g.app == "" ? "appname global" : "appname"}
                            :text {g.name} :halign "start" :limit-width 22))
-                  (box :hexpand true)))
+                  (box :hexpand true)
+                  (label :class {g.last_seen == "null" ? "lastseen never" : "lastseen"}
+                         :text {g.last_seen_ago})))
               (button :class "infobtn"
                       :tooltip "binary details"
                       :onclick "~/.config/eww/scripts/pfsnitch-appinfo-show '${g.app}'" "")
@@ -142,6 +144,11 @@
                          :limit-width 24
                          :tooltip "${r.kind}  ${r.value}${r.comment != "" ? "  -  " : ""}${r.comment}")
                   (box :hexpand true)
+                  ;; When this rule was last used. The question people actually
+                  ;; ask of a rule list is whether an entry is still in use or
+                  ;; left over from something they did months ago.
+                  (label :class {r.last_seen == "null" ? "lastseen never" : "lastseen"}
+                         :text {r.last_seen_ago})
                   (button :class "rmbtn"
                           :tooltip "remove this rule"
                           :onclick "doas -n pfsnitch rm '${r.kind}' ${r.value}" "")))))))))

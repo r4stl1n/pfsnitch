@@ -71,6 +71,7 @@ for one program would silently re-open it for one you had blocked.
 
 ```sh
 pfsnitch apps                    # rules grouped by application
+                                 # with when each was last used
 pfsnitch rules                   # flat list
 pfsnitch status                  # daemon, mode, counts
 
