@@ -1,0 +1,9 @@
+#!/bin/sh
+# Rule list for the management popup.
+#
+# Only referenced by the popup, and eww polls a var only while a window using it
+# is open - so this costs nothing until the panel is actually on screen.
+set -u
+RULES=$(pfsnitch rules --json 2>/dev/null | tr -d '\n')
+[ -n "$RULES" ] || RULES='[]'
+printf '{"list":%s}\n' "$RULES"

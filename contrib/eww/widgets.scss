@@ -1,0 +1,216 @@
+/* pfsnitch widget styling for eww.
+ *
+ * Colours are chosen so allow vs deny, and armed vs observing, are never
+ * distinguishable by wording alone - a security panel should be readable at
+ * a glance and at a distance.
+ */
+
+/* ---- pfsnitch connection prompt ---- */
+.lfprompt {
+  background-color: rgba(17, 19, 24, 0.98);
+  border: 1px solid rgba(255, 159, 67, 0.55);
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+.lftitle { color: #ff9f43; font-weight: bold; font-size: 14px; }
+.lfcmd   { color: #ffffff; font-weight: bold; }
+.lfpath  { color: #8b93a1; font-size: 11px; }
+.lfdst   { color: #33ccff; }
+.lfnote  { color: #6b7280; font-size: 10px; margin-top: 4px; }
+.lfbtn {
+  padding: 6px 10px;
+  border-radius: 5px;
+  background-color: rgba(255, 255, 255, 0.07);
+  color: #c8ccd4;
+}
+.lfbtn:hover      { background-color: rgba(255, 255, 255, 0.16); }
+.lfbtn.once:hover { background-color: rgba(51, 204, 255, 0.25); color: #33ccff; }
+.lfbtn.app:hover  { background-color: rgba(0, 255, 153, 0.22); color: #00ff99; }
+.lfbtn.block      { background-color: rgba(255, 107, 107, 0.18); color: #ff6b6b; }
+.lfbtn.block:hover{ background-color: rgba(255, 107, 107, 0.32); }
+.lfhost { color: #00ff99; font-weight: bold; }
+.chip.snitch .icon            { color: #33ccff; }
+.chip.snitch.armed .icon      { color: #00ff99; }
+.chip.snitch.armed .val       { color: #00ff99; }
+.chip.snitch.down             { background-color: rgba(255, 107, 107, 0.16); }
+.chip.snitch.down .icon,
+.chip.snitch.down .val        { color: #ff6b6b; }
+.snitchpanel .modebadge {
+  padding: 0 7px;
+  border-radius: 3px;
+  font-size: 11px;
+  background-color: rgba(51, 204, 255, 0.18);
+  color: #33ccff;
+}
+.snitchpanel .modebadge.armed {
+  background-color: rgba(0, 255, 153, 0.18);
+  color: #00ff99;
+}
+.snitchpanel .modebadge.down {
+  background-color: rgba(255, 107, 107, 0.20);
+  color: #ff6b6b;
+}
+.closebtn {
+  padding: 0 6px;
+  border-radius: 4px;
+  color: #6b7280;
+  font-size: 14px;
+}
+.closebtn:hover { background-color: rgba(255, 255, 255, 0.12); color: #ffffff; }
+.rulehead { margin-top: 2px; }
+.rulescroll { margin: 2px 0; }
+.rulerow {
+  padding: 3px 6px;
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.04);
+}
+.rulerow:hover { background-color: rgba(255, 255, 255, 0.08); }
+.kindbadge {
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  color: #6b7280;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+.kindbadge.allow-host,
+.kindbadge.allow-app,
+.kindbadge.allow-dest {
+  background-color: rgba(0, 255, 153, 0.15);
+  color: #00ff99;
+}
+.kindbadge.deny-host,
+.kindbadge.deny-app {
+  background-color: rgba(255, 107, 107, 0.18);
+  color: #ff6b6b;
+}
+.rulevalue { color: #c8ccd4; }
+.rmbtn {
+  padding: 0 7px;
+  border-radius: 4px;
+  color: #6b7280;
+  font-size: 12px;
+}
+.rmbtn:hover { background-color: rgba(255, 107, 107, 0.22); color: #ff6b6b; }
+.hint {
+  color: #4b5563;
+  font-size: 10px;
+  margin-top: 2px;
+}
+.snitchpanel,
+.rulescroll,
+.rulescroll viewport,
+.rulescroll scrolledwindow {
+  background-color: rgba(17, 19, 24, 0.99);
+}
+/* Dim enough to stay out of the way, bright enough to find. */
+.rmbtn    { color: #9ca3af; }
+.closebtn { color: #9ca3af; }
+/* ---- mode toggle ---- */
+.modetoggle {
+  border-radius: 5px;
+  background-color: rgba(255, 255, 255, 0.05);
+  padding: 2px;
+  margin: 2px 0;
+}
+.modebtn {
+  padding: 3px 0;
+  border-radius: 4px;
+  color: #6b7280;
+  font-size: 12px;
+}
+.modebtn:hover { background-color: rgba(255, 255, 255, 0.09); color: #c8ccd4; }
+.modebtn.vis.on {
+  background-color: rgba(51, 204, 255, 0.20);
+  color: #33ccff;
+}
+.modebtn.enf.on {
+  background-color: rgba(0, 255, 153, 0.20);
+  color: #00ff99;
+}
+.lfbtn.blockapp {
+  background-color: rgba(255, 107, 107, 0.10);
+  color: #b45; 
+}
+.lfbtn.blockapp:hover { background-color: rgba(255, 107, 107, 0.30); color: #ff6b6b; }
+/* ---- rules grouped by application ---- */
+.appgroups { margin: 2px 0; }
+.apphead {
+  padding: 4px 7px;
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.05);
+}
+.apphead:hover { background-color: rgba(255, 255, 255, 0.10); }
+.apphead.open  { background-color: rgba(51, 204, 255, 0.13); }
+.caret   { color: #6b7280; font-size: 10px; }
+.appname { color: #c8ccd4; }
+/* The catch-all group is infrastructure, not an app - say so visually. */
+.appname.global { color: #6b7280; font-style: italic; }
+/* Allow and deny counts must not be mistaken for one another at a glance. */
+.cnt {
+  padding: 0 6px;
+  margin-left: 3px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.cnt.allow { background-color: rgba(0, 255, 153, 0.15); color: #00ff99; }
+.cnt.deny  { background-color: rgba(255, 107, 107, 0.18); color: #ff6b6b; }
+/* Zero denies should not read as an alarm. */
+.cnt.deny.zero { background-color: rgba(255, 255, 255, 0.05); color: #4b5563; }
+.apprules { margin: 0 0 3px 14px; }
+.effect {
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.effect.allow { background-color: rgba(0, 255, 153, 0.15); color: #00ff99; }
+.effect.deny  { background-color: rgba(255, 107, 107, 0.18); color: #ff6b6b; }
+/* Ease the normal handover so the highlight slides rather than snaps. */
+.modebtn {
+  transition: background-color 180ms ease-out, color 180ms ease-out;
+}
+.modebtn.leaving {
+  opacity: 0.35;
+  transition: opacity 180ms ease-out;
+}
+.seclabel.switching { color: #33ccff; }
+/* While the switch is in flight, breathe the target button. */
+@keyframes pf-pulse {
+  0%   { opacity: 1.0; }
+  50%  { opacity: 0.38; }
+  100% { opacity: 1.0; }
+}
+.modebtn.pending { animation: pf-pulse 620ms ease-in-out infinite; }
+.appdir { color: #565f6e; }
+/* ---- app info ---- */
+.approw { }
+.infobtn {
+  padding: 0 5px;
+  border-radius: 4px;
+  color: #6b7280;
+  font-size: 14px;
+}
+.infobtn:hover { background-color: rgba(51, 204, 255, 0.20); color: #33ccff; }
+.appinfopanel .aipath {
+  color: #c8ccd4;
+  font-size: 11px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  padding: 4px 7px;
+}
+.appinfopanel .aibody { margin-top: 2px; }
+.airow  { padding: 0 2px; }
+.aikey  { color: #6b7280; font-size: 11px; min-width: 74px; }
+.aival  { color: #c8ccd4; font-size: 11px; }
+/* Neutral by default; only shouts when there is something to shout about. */
+.aiwarn {
+  color: #6b7280;
+  font-size: 10px;
+  margin-top: 4px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  background-color: rgba(255, 255, 255, 0.04);
+}
+.aiwarn.on {
+  color: #ff6b6b;
+  background-color: rgba(255, 107, 107, 0.14);
+}

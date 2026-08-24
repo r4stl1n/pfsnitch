@@ -1,0 +1,12 @@
+#!/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin; export PATH
+
+# pfsnitch-prompt-deny - refuse everything not already in policy.
+#
+# For unattended machines where the rule set is managed elsewhere (config
+# management, a golden image) and no interactive approval should ever happen.
+#
+# Prints `timeout` rather than `block` deliberately: the packet is still
+# dropped, but nothing is written to the policy file, so this backend cannot
+# quietly fill the ruleset with deny entries.
+echo timeout

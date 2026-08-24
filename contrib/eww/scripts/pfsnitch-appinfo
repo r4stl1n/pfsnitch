@@ -1,0 +1,68 @@
+#!/bin/sh
+# pfsnitch-appinfo <path>  - facts about a binary a rule refers to, as JSON.
+#
+# Computed on click rather than polled: none of this changes second to second,
+# and hashing a binary on a timer would be a silly thing to do to a laptop.
+#
+# The fields are chosen for reviewing a rule, not for admiring a file. A rule is
+# a standing permission attached to a path, so the questions that matter are:
+# does that path still exist, has it changed since you approved it, and can
+# anyone but root replace it?
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+P="${1:-}"
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+if [ -z "$P" ]; then
+    printf '{"path":"","name":"any application","kind":"global"}\n'
+    exit 0
+fi
+
+NAME=${P##*/}
+if [ ! -e "$P" ]; then
+    # A rule pointing at a path that no longer exists is dead weight - and, if
+    # something later takes that name, a permission waiting to be inherited.
+    printf '{"path":"%s","name":"%s","kind":"binary","exists":false}\n' "$(jesc "$P")" "$(jesc "$NAME")"
+    exit 0
+fi
+
+SIZE=$(stat -f %z "$P" 2>/dev/null)
+MTIME=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$P" 2>/dev/null)
+OWNER=$(stat -f "%Su:%Sg" "$P" 2>/dev/null)
+MODE=$(stat -f "%Sp" "$P" 2>/dev/null)
+OCTAL=$(stat -f "%Lp" "$P" 2>/dev/null)
+
+# Human size, because "3.2M" is read faster than "3355443".
+if [ "${SIZE:-0}" -ge 1048576 ]; then
+    HSIZE="$(( SIZE / 1048576 )).$(( (SIZE % 1048576) * 10 / 1048576 ))M"
+elif [ "${SIZE:-0}" -ge 1024 ]; then
+    HSIZE="$(( SIZE / 1024 ))K"
+else
+    HSIZE="${SIZE:-0}B"
+fi
+
+# Group- or world-writable means someone other than the owner can swap the
+# binary out from under a rule that trusts this path. Worth shouting about.
+case "$OCTAL" in
+    *[2367]) WRITABLE=true ;;
+    *[2367]?) WRITABLE=true ;;
+    *) WRITABLE=false ;;
+esac
+case "$MODE" in
+    ???[sS]*) SETUID=true ;;
+    *) SETUID=false ;;
+esac
+
+# Cheap identity check: if this differs from the last time you looked, the
+# binary behind the rule is not the one you approved.
+SHA=$(sha256 -q "$P" 2>/dev/null | cut -c1-32)
+
+PIDS=$(pgrep -x "$(echo "$NAME" | cut -c1-19)" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')
+NRUN=$(printf '%s' "$PIDS" | wc -w | tr -d ' ')
+
+printf '{"path":"%s","name":"%s","kind":"binary","exists":true,' "$(jesc "$P")" "$(jesc "$NAME")"
+printf '"size":"%s","modified":"%s","owner":"%s","mode":"%s",' "$HSIZE" "$MTIME" "$OWNER" "$MODE"
+printf '"writable":%s,"setuid":%s,"sha":"%s",' "$WRITABLE" "$SETUID" "${SHA:-unknown}"
+printf '"running":%s,"pids":"%s"}\n' "${NRUN:-0}" "$(jesc "$PIDS")"

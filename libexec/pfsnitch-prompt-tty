@@ -1,0 +1,48 @@
+#!/bin/sh
+# pfsnitch-prompt-tty EXE PID COMMAND DST DPORT [HOSTNAME]
+#
+# Asks on a terminal, for machines with no graphical session. Writes to the
+# console (or the first logged-in user's tty) and reads the reply from it.
+#
+# If there is no terminal to ask on it prints `timeout`, not `block`: a server
+# with nobody watching should drop the packet, not accumulate permanent deny
+# rules for software no human ever judged.
+# The daemon is started by rc.d with PATH=/sbin:/bin:/usr/sbin:/usr/bin - no
+# /usr/local/bin, which is where eww and every other port lives. A prompt must
+# not depend on how its caller was launched, so set a complete PATH here rather
+# than inherit one and fail silently.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+set -u
+. /usr/local/libexec/pfsnitch-prompt-common
+
+# Prefer a real logged-in terminal; fall back to the system console.
+TTY=$(who 2>/dev/null | awk 'NR==1 {print "/dev/" $2}')
+[ -n "${TTY:-}" ] && [ -c "$TTY" ] && [ -w "$TTY" ] || TTY=/dev/console
+[ -c "$TTY" ] && [ -w "$TTY" ] || { echo timeout; exit 0; }
+
+pf_init
+{
+    printf '\n'
+    printf '  pfsnitch: outbound connection request\n'
+    printf '    %s\n' "$(pf_describe)"
+    printf '    binary: %s\n' "$EXE"
+    printf "    [c] allow connection  [a] allow app  [b] block connection  [B] block app  (60s -> timeout)\n"
+    printf '  choice: '
+} > "$TTY" 2>/dev/null
+
+# read(1) with -t needs the tty on stdin; 60s matches the other backends.
+ANS=timeout
+if read -t 60 -r REPLY < "$TTY" 2>/dev/null; then
+    case "$REPLY" in
+        c|C|allow-conn) ANS=allow-conn ;;
+        a|A|allow-app)  ANS=allow-app ;;
+        b|block)          ANS=block-conn ;;
+        B|block-app)      ANS=block-app ;;
+        *)              ANS=timeout ;;
+    esac
+fi
+printf '  -> %s\n' "$ANS" > "$TTY" 2>/dev/null
+pf_cleanup
+printf '%s\n' "$ANS"

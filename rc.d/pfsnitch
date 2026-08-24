@@ -1,0 +1,171 @@
+#!/bin/sh
+#
+# PROVIDE: pfsnitch
+# REQUIRE: pf NETWORKING
+# KEYWORD: shutdown
+#
+# rc.d service for pfsnitch.
+#
+# The ordering matters in both directions:
+#   start - daemon FIRST, divert rules second. Loading rules with no daemon
+#           listening drops every matching packet.
+#   stop  - rules FIRST, daemon second, for exactly the same reason.
+#
+# A watchdog runs alongside and flushes the anchor if the daemon dies, so a
+# crash fails OPEN rather than taking the network down.
+
+. /etc/rc.subr
+
+name="pfsnitch"
+rcvar="pfsnitch_enable"
+
+load_rc_config $name
+: ${pfsnitch_enable:="NO"}
+: ${pfsnitch_mode:="visibility"}          # visibility | enforcement (policy file wins)
+: ${pfsnitch_anchor:="/usr/local/etc/pfsnitch/anchor.conf"}
+: ${pfsnitch_watchdog:="YES"}
+
+# What the watchdog does if a RUNNING daemon dies. Boot is always closed (the
+# anchor starts empty); this governs only the crash case.
+#   open   - restore unfiltered traffic, keep the machine working
+#   closed - no outbound at all until pfsnitch is back
+: ${pfsnitch_failmode:="open"}
+
+# Which program asks the user about a new connection, and which backend that
+# program picks. Either may be left empty: the daemon then falls back to the
+# `prompt` directive in policy.conf, and finally to the bundled dispatcher.
+# Setting pfsnitch_prompt to any executable honouring the documented contract
+# (argv in, one word on stdout) replaces the prompt entirely - no desktop, no
+# toolkit and no part of this package is assumed.
+: ${pfsnitch_prompt:=""}                # e.g. /usr/local/bin/my-prompt
+: ${pfsnitch_prompt_backend:=""}        # auto (default) | eww | tty | file | deny
+
+[ -n "${pfsnitch_prompt}" ] && export PFSNITCH_PROMPT="${pfsnitch_prompt}"
+[ -n "${pfsnitch_prompt_backend}" ] && export PFSNITCH_PROMPT_BACKEND="${pfsnitch_prompt_backend}"
+
+pidfile="/var/run/pfsnitch.pid"
+command="/usr/sbin/daemon"
+command_args="-f -r -P ${pidfile} -p /var/run/pfsnitch.child.pid -t pfsnitch \
+              -o /var/log/pfsnitch.log \
+              /usr/local/bin/pfsnitch ${pfsnitch_mode}"
+
+start_precmd="pfsnitch_prestart"
+start_postcmd="pfsnitch_poststart"
+stop_cmd="pfsnitch_stop"
+stop_postcmd="pfsnitch_poststop"
+
+# Re-load anchor.conf after editing it, without restarting the daemon and so
+# without dropping the divert socket.
+#
+# Note that a plain `pfctl -f /etc/pf.conf` does NOT need this: anchor contents
+# are a separate ruleset and survive a main-ruleset reload. Only an explicit
+# flush, or a boot where the anchor has never been loaded, empties it.
+extra_commands="reload"
+reload_cmd="pfsnitch_reload"
+
+pfsnitch_prestart() {
+    # pfsnitch enforces through pf rules, so a disabled pf means the daemon is
+    # running but enforcing nothing - and /etc/pf.conf is also what blocks
+    # outbound in the first place. pfsnitch-panic deliberately disables pf, so
+    # this is the step that makes `service pfsnitch start` a complete restore.
+    if pfctl -s info 2>/dev/null | head -1 | grep -q Disabled; then
+        warn "pf is disabled; enabling it (pfsnitch enforces through pf)"
+        pfctl -e >/dev/null 2>&1
+    fi
+    if ! kldstat -q -m ipdivert; then
+        kldload ipdivert || { warn "cannot load ipdivert"; return 1; }
+    fi
+    # never start with stale rules in place
+    pfctl -a pfsnitch -F rules >/dev/null 2>&1
+}
+
+pfsnitch_poststart() {
+    # Wait for the daemon to actually hold the divert socket before installing
+    # rules. Racing this is how you blackhole the network on boot.
+    n=0
+    while [ $n -lt 50 ]; do
+        if pgrep -x pfsnitch >/dev/null 2>&1; then break; fi
+        sleep 0.1
+        n=$((n + 1))
+    done
+    if ! pgrep -x pfsnitch >/dev/null 2>&1; then
+        warn "pfsnitch did not start; NOT installing divert rules"
+        return 1
+    fi
+    pfctl -a pfsnitch -f "${pfsnitch_anchor}" || {
+        warn "anchor failed to load; stopping daemon to avoid a half state"
+        pkill -x pfsnitch
+        return 1
+    }
+    # `&` alone leaves stdout attached to the rc script, and `service` then
+    # blocks waiting for EOF. daemon(8) detaches it properly.
+    if [ "${pfsnitch_watchdog}" = "YES" ]; then
+        PFSNITCH_FAILMODE="${pfsnitch_failmode}" \
+        /usr/sbin/daemon -f -P /var/run/pfsnitch-watchdog.pid \
+            /usr/local/libexec/pfsnitch-watchdog
+    fi
+    return 0
+}
+
+pfsnitch_stop() {
+    # Rules out first, so no packet is ever diverted at a daemon that is going
+    # away. This is the one ordering that must not be reversed.
+    pfctl -a pfsnitch -F rules >/dev/null 2>&1
+
+    # Watchdog before the daemon, otherwise it watches the daemon vanish and
+    # logs a fail-open that never happened.
+    if [ -f /var/run/pfsnitch-watchdog.pid ]; then
+        kill "$(cat /var/run/pfsnitch-watchdog.pid)" 2>/dev/null || true
+        rm -f /var/run/pfsnitch-watchdog.pid
+    fi
+    pkill -f pfsnitch-watchdog >/dev/null 2>&1 || true
+
+    # The supervisor MUST die before the child. daemon(8) runs with -r, so
+    # killing the child on its own just makes it respawn - which is exactly the
+    # behaviour that makes this service look unstoppable.
+    #
+    # Prefer the pidfile, but do not trust it: daemon(8) truncates it on some
+    # exits, and rc.subr treats an empty pidfile as "nothing to kill" and then
+    # cheerfully reports success. Fall back to the supervisor's process title so
+    # a stale or empty pidfile cannot strand a running daemon.
+    sup=$(cat "${pidfile}" 2>/dev/null || true)
+    case "$sup" in
+        ''|*[!0-9]*) sup=$(pgrep -f 'daemon: pfsnitch' 2>/dev/null || true) ;;
+    esac
+    [ -n "$sup" ] && kill $sup 2>/dev/null
+
+    pkill -x pfsnitch >/dev/null 2>&1 || true
+
+    n=0
+    while [ $n -lt 25 ]; do
+        pgrep -x pfsnitch >/dev/null 2>&1 || break
+        sleep 0.2
+        n=$((n + 1))
+    done
+    if pgrep -x pfsnitch >/dev/null 2>&1; then
+        warn "pfsnitch did not exit on TERM; sending KILL"
+        pkill -9 -x pfsnitch >/dev/null 2>&1 || true
+    fi
+
+    rm -f "${pidfile}" /var/run/pfsnitch.child.pid 2>/dev/null
+    echo "Stopping pfsnitch."
+}
+
+pfsnitch_reload() {
+    if ! pgrep -x pfsnitch >/dev/null 2>&1; then
+        warn "pfsnitch is not running; use start"
+        return 1
+    fi
+    pfctl -a pfsnitch -f "${pfsnitch_anchor}" || {
+        warn "anchor failed to load; leaving the previous rules in place"
+        return 1
+    }
+    echo "Reloaded pfsnitch anchor."
+}
+
+pfsnitch_poststop() {
+    pfctl -a pfsnitch -F rules >/dev/null 2>&1
+    rm -f /var/run/pfsnitch/answer /var/run/pfsnitch/nonce 2>/dev/null
+}
+
+run_rc_command "$1"

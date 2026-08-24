@@ -1,0 +1,26 @@
+#!/bin/sh
+# pfsnitch-prompt-file EXE PID COMMAND DST DPORT [HOSTNAME]
+#
+# The frontend-agnostic backend. It draws nothing: it publishes the request as
+# JSON at /var/run/pfsnitch/pending.json and waits for an answer.
+#
+# Any frontend at all can drive this - a TUI, a web page, a phone app, a shell
+# one-liner - by doing two things:
+#
+#   1. read  /var/run/pfsnitch/pending.json   (appears when a decision is needed)
+#   2. run   pfsnitch-answer allow-conn|allow-app|block
+#
+# That is the entire integration surface. No socket, no D-Bus, no library.
+# The daemon is started by rc.d with PATH=/sbin:/bin:/usr/sbin:/usr/bin - no
+# /usr/local/bin, which is where eww and every other port lives. A prompt must
+# not depend on how its caller was launched, so set a complete PATH here rather
+# than inherit one and fail silently.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+set -u
+. /usr/local/libexec/pfsnitch-prompt-common
+pf_init
+ANS=$(pf_wait 120)
+pf_cleanup
+printf '%s\n' "$ANS"

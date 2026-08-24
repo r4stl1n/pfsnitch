@@ -1,0 +1,245 @@
+;; pfsnitch widgets for eww.
+;;
+;; Drop these forms into your eww.yuck and the scripts into
+;; ~/.config/eww/scripts/, then add (w_snitch) to your bar. Nothing here depends
+;; on the rest of any particular bar config.
+;;
+;; Styling lives in widgets.scss.
+
+(defvar lf_exe   "")
+(defvar lf_pid   "")
+(defvar lf_cmd   "")
+(defvar lf_dst   "")
+(defvar lf_dport "")
+(defvar lf_host  "-")
+
+;; ------------------------------ widgets -----------------------------
+(defpoll snitch :interval "10s"
+                :initial '{"running":false,"mode":"off","label":"off","icon":"","level":"down","total":0,"tip":""}'
+                `$HOME/.config/eww/scripts/pfsnitch-status`)
+
+;; Only the management panel reads this, and eww polls a var only while a
+;; window using it is open - so listing rules costs nothing until the panel
+;; is actually on screen.
+;; Which application group is expanded. One at a time: the panel is narrow,
+;; and an accordion keeps the app you are looking at on screen instead of
+;; pushing it off the bottom.
+;; Sentinel rather than "": the catch-all group's key IS the empty string,
+;; so defaulting to "" would silently leave it expanded after every reload.
+(defpoll snitch_apps :interval "3s"
+                     :initial '{"apps":[]}'
+                     `$HOME/.config/eww/scripts/pfsnitch-apps`)
+
+(defpoll snitch_rules :interval "3s"
+                      :initial '{"list":[]}'
+                      `$HOME/.config/eww/scripts/pfsnitch-rules`)
+
+(defvar snitch_open "::none::")
+
+;; The mode the user just asked for, while the switch is in flight. Drives the
+;; button animation, and lets the toggle react on the click instead of on the
+;; next 10s poll.
+(defvar snitch_pending "")
+
+;; Details of whichever binary the info button was last pressed on. Filled on
+;; click rather than polled - none of it changes second to second, and hashing
+;; a binary on a timer would be a silly thing to do to a laptop.
+(defvar snitch_appinfo '{"path":"","name":"","kind":"global"}')
+
+(defwidget w_snitch []
+  ;; Click, not hover: the panel holds buttons, and a hover-close would pull it
+  ;; out from under the pointer on the way to them.
+  (eventbox :onclick "eww open --toggle secpopup"
+  (box :class "chip snitch ${snitch.level}" :orientation "h" :space-evenly false :spacing 6
+       :tooltip {snitch.tip}
+    (label :class "icon" :text {snitch.icon})
+    (label :class "val"  :text {snitch.label}))))
+
+(defwidget secpopup_content []
+  (box :class "popup snitchpanel" :orientation "v" :space-evenly false :spacing 8
+    (box :orientation "h" :space-evenly false :spacing 8
+      (label :class "icon" :text {snitch.icon})
+      (label :class "popup-val" :text "pfsnitch")
+      (label :class "modebadge ${snitch.level}" :text {snitch.mode})
+      (box :hexpand true)
+      (button :class "closebtn" :onclick "eww close secpopup" ""))
+
+    ;; A segmented pair rather than a switch: for a security setting, both
+    ;; states should be readable at a glance instead of inferred from which way
+    ;; a toggle is thrown. The active side is highlighted; clicking the other
+    ;; side switches, and the daemon picks it up within a second - no restart,
+    ;; so there is never a gap where traffic passes unfiltered.
+    (box :class "modetoggle" :orientation "h" :space-evenly true :spacing 0
+      (button :class {(snitch_pending != "" && snitch_pending != snitch.mode)
+                      ? (snitch_pending == "visibility" ? "modebtn vis on pending" : "modebtn vis leaving")
+                      : (snitch.mode == "visibility" ? "modebtn vis on" : "modebtn vis")}
+              :tooltip "watch and learn - record new destinations, block nothing"
+              :onclick "~/.config/eww/scripts/pfsnitch-setmode visibility"
+        "visibility")
+      (button :class {(snitch_pending != "" && snitch_pending != snitch.mode)
+                      ? (snitch_pending == "enforcement" ? "modebtn enf on pending" : "modebtn enf leaving")
+                      : (snitch.mode == "enforcement" ? "modebtn enf on" : "modebtn enf")}
+              :tooltip "block what is not approved, and prompt for new destinations"
+              :onclick "~/.config/eww/scripts/pfsnitch-setmode enforcement"
+        "enforcement"))
+
+    (label :class {(snitch_pending != "" && snitch_pending != snitch.mode) ? "seclabel switching" : "seclabel"}
+           :text {(snitch_pending != "" && snitch_pending != snitch.mode) ? "switching to ${snitch_pending}..." : snitch.tip}
+           :halign "start")
+
+    (box :class "rulehead" :orientation "h" :space-evenly false :spacing 8
+      (label :class "seclabel" :text "rules" :halign "start")
+      (box :hexpand true)
+      (label :class "seclabel" :text "${snitch.total} total" :halign "end"))
+
+    ;; Fixed height so the panel does not resize as rules come and go - a
+    ;; window that changes size under the pointer is hard to click.
+    ;; Grouped by application: one collapsible row per binary, plus a final
+    ;; group for the rules that match every binary. The counts live in the
+    ;; header so the shape of an app's policy is readable without expanding it.
+    (scroll :class "rulescroll" :height 260 :vscroll true :hscroll false
+      (box :class "appgroups" :orientation "v" :space-evenly false :spacing 3
+        (for g in {snitch_apps.apps}
+          (box :orientation "v" :space-evenly false :spacing 2
+            ;; A row, not one big button: GTK does not nest buttons sensibly, and
+            ;; the info control has to be independently clickable from the
+            ;; expander it sits next to.
+            (box :class "approw" :orientation "h" :space-evenly false :spacing 3
+              (button :class {snitch_open == g.app ? "apphead open" : "apphead"}
+                      :hexpand true
+                      :tooltip {g.app == "" ? "rules that apply to every binary" : g.app}
+                      :onclick "~/.config/eww/scripts/pfsnitch-toggle '${g.app}'"
+                (box :orientation "h" :space-evenly false :spacing 7
+                  (label :class "caret" :text {snitch_open == g.app ? "v" : ">"})
+                  ;; Directory quiet, binary loud, no gap between them so it
+                  ;; still reads as one path. The directory is the half that
+                  ;; matters for identity - /tmp/git and /usr/local/bin/git are
+                  ;; different programs - so it belongs on screen, not only in
+                  ;; a tooltip.
+                  (box :orientation "h" :space-evenly false :spacing 0
+                    (label :class "appdir" :text {g.dir_short} :halign "start")
+                    (label :class {g.app == "" ? "appname global" : "appname"}
+                           :text {g.name} :halign "start" :limit-width 22))
+                  (box :hexpand true)))
+              (button :class "infobtn"
+                      :tooltip "binary details"
+                      :onclick "~/.config/eww/scripts/pfsnitch-appinfo-show '${g.app}'" "")
+              (label :class "cnt allow" :text "${g.allow}")
+              (label :class {g.deny > 0 ? "cnt deny" : "cnt deny zero"} :text "${g.deny}"))
+
+            ;; Rendered only while open. eww has no way to animate this, so the
+            ;; caret is what tells you the row is expandable.
+            (revealer :transition "slidedown" :duration "140ms"
+                      :reveal {snitch_open == g.app}
+            (box :class "apprules" :orientation "v" :space-evenly false :spacing 2
+              (for r in {g.rules}
+                (box :class "rulerow" :orientation "h" :space-evenly false :spacing 8
+                  (label :class "effect ${r.effect}" :text {r.effect})
+                  (label :class "rulevalue" :text {r.dest} :halign "start"
+                         :limit-width 24
+                         :tooltip "${r.kind}  ${r.value}${r.comment != "" ? "  -  " : ""}${r.comment}")
+                  (box :hexpand true)
+                  (button :class "rmbtn"
+                          :tooltip "remove this rule"
+                          :onclick "doas -n pfsnitch rm '${r.kind}' ${r.value}" "")))))))))
+
+    (label :class "hint" :halign "start"
+           :text "approve from a prompt, or: pfsnitch allow host <name>")))
+
+(defwindow secpopup
+  :monitor 0
+  :geometry (geometry :x "8px" :y "6px" :width "420px" :height "334px" :anchor "top right")
+  :stacking "overlay"
+  (secpopup_content))
+
+;; ------------------------- application details -----------------------
+;; Opened from the info button on an app row. Everything here answers one
+;; question: is the binary this rule points at still the binary you approved?
+
+(defwidget lfprompt_content []
+  (box :class "lfprompt" :orientation "v" :space-evenly false :spacing 10
+    (label :class "lftitle" :text "Outbound connection" :halign "start")
+    (box :orientation "v" :space-evenly false :spacing 3
+      (label :class "lfcmd"  :text "${lf_cmd}  [${lf_pid}]" :halign "start")
+      (label :class "lfpath" :text lf_exe :halign "start" :limit-width 46)
+      (label :class "lfhost" :text {lf_host == "-" ? "(no hostname seen)" : lf_host} :halign "start")
+      (label :class "lfdst"  :text "-> ${lf_dst}:${lf_dport}" :halign "start"))
+    ;; Two rows of two, so allow and block are visibly symmetric: each has a
+    ;; "this destination" option and a "whole binary" option. Block defaults to
+    ;; the narrow one - blocking an app's metrics endpoint should not take the
+    ;; app off the network.
+    (box :orientation "v" :space-evenly false :spacing 6
+      (box :orientation "h" :space-evenly true :spacing 8
+        (button :class "lfbtn once" :onclick "pfsnitch-answer allow-conn" "Allow connection")
+        (button :class "lfbtn app"  :onclick "pfsnitch-answer allow-app"  "Allow app"))
+      (box :orientation "h" :space-evenly true :spacing 8
+        (button :class "lfbtn block"    :onclick "pfsnitch-answer block-conn" "Block connection")
+        (button :class "lfbtn blockapp" :onclick "pfsnitch-answer block-app"  "Block app")))
+    ;; Allow app is enforced by the daemon, not the firewall - pf cannot
+    ;; match a process. Approved destinations are open to everything.
+    (box :class "lfnotes" :orientation "v" :space-evenly false
+      (label :class "lfnote" :xalign 0 :text "Allow connection approves this destination for this binary only.")
+      (label :class "lfnote" :xalign 0 :text "Block connection denies this destination to this binary only.")
+      (label :class "lfnote" :xalign 0 :text "The app-wide options cover every destination."))))
+
+;; ------------------------------ windows -----------------------------
+(defwindow lfprompt
+  :monitor 0
+  :geometry (geometry :x "0" :y "0" :width "540px" :height "310px" :anchor "center")
+  :stacking "overlay"
+  :focusable true
+  (lfprompt_content))
+
+;; ---------------------- pfsnitch management panel --------------------
+;; Everything here is a thin view over `pfsnitch rules --json` and
+;; `pfsnitch rm`. The panel holds no state of its own, so rules changed from a
+;; shell, an editor or another frontend show up here within one poll - and
+;; anything done here is just as visible to them.
+
+(defwidget airow [k v]
+  (box :class "airow" :orientation "h" :space-evenly false :spacing 8
+    (label :class "aikey" :text k :halign "start")
+    (label :class "aival" :text v :halign "start" :limit-width 34)))
+
+(defwidget appinfo_content []
+  (box :class "popup appinfopanel" :orientation "v" :space-evenly false :spacing 7
+    (box :orientation "h" :space-evenly false :spacing 8
+      (label :class "icon" :text "")
+      (label :class "popup-val" :text {snitch_appinfo.name ?: "-"})
+      (box :hexpand true)
+      (button :class "closebtn" :onclick "eww close appinfo" ""))
+
+    ;; The full path, which is the thing the rule is actually keyed on.
+    (label :class "aipath" :text {snitch_appinfo.path ?: ""} :halign "start" :limit-width 52)
+
+    (box :class "aibody" :orientation "v" :space-evenly false :spacing 3
+      (airow :k "status"   :v {snitch_appinfo.kind == "global" ? "matches every binary"
+                               : (snitch_appinfo.exists ?: false) ? "present on disk"
+                               : "MISSING - the binary this rule names is gone"})
+      (airow :k "size"     :v {snitch_appinfo.size ?: "-"})
+      (airow :k "modified" :v {snitch_appinfo.modified ?: "-"})
+      (airow :k "owner"    :v {snitch_appinfo.owner ?: "-"})
+      (airow :k "mode"     :v {snitch_appinfo.mode ?: "-"})
+      (airow :k "sha256"   :v {snitch_appinfo.sha ?: "-"})
+      (airow :k "running"  :v {(snitch_appinfo.running ?: 0) > 0
+                               ? "yes - pid ${snitch_appinfo.pids}"
+                               : "not running"}))
+
+    ;; Anything that means "someone could swap this binary out from under a
+    ;; rule that trusts this path" gets said plainly rather than left to be
+    ;; inferred from a mode string.
+    (label :class {(snitch_appinfo.writable ?: false) || (snitch_appinfo.setuid ?: false)
+                   || ((snitch_appinfo.kind ?: "") == "binary" && !(snitch_appinfo.exists ?: false))
+                   ? "aiwarn on" : "aiwarn"}
+           :halign "start" :limit-width 52
+           :text {(snitch_appinfo.kind ?: "") == "global" ? "Applies to every program, not one binary."
+                  : !(snitch_appinfo.exists ?: false) ? "Stale rule - nothing exists at this path."
+                  : (snitch_appinfo.writable ?: false) ? "Writable by others - they could replace it."
+                  : (snitch_appinfo.setuid ?: false) ? "Setuid binary."
+                  : "Root-owned, not writable by others."})))
+
+(defwindow appinfo
+  :monitor 0
+  :geometry (geometry :x "8px" :y "348px" :width "440px" :height "300px" :anchor "top right")
+  :stacking "overlay"
+  (appinfo_content))

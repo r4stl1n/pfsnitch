@@ -1,0 +1,56 @@
+#!/bin/sh
+# Switch mode, with feedback that starts on the click rather than on the poll.
+#
+# The chip's status is a 10s defpoll, so without this the button would not
+# change for up to ten seconds after being clicked - long enough to look broken
+# and get clicked again. So: mark the target pending immediately, then push the
+# real status as soon as the switch has landed instead of waiting for the poll.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+M="${1:-}"
+case "$M" in
+visibility|enforcement) ;;
+*) echo "usage: pfsnitch-setmode visibility|enforcement" >&2; exit 64 ;;
+esac
+
+# Detach from eww before doing anything slow.
+#
+# eww appears to reap the child of an :onclick when the widget re-renders, and
+# this script deliberately CAUSES a re-render (it sets snitch_pending, which the
+# button's class depends on). Run under daemon(8) so the work outlives the
+# rebuild; otherwise the last line never runs and the UI stays stuck showing
+# "switching..." forever - which is exactly the bug this comment exists for.
+if [ "${PFSNITCH_DETACHED:-0}" != 1 ]; then
+    PFSNITCH_DETACHED=1
+    export PFSNITCH_DETACHED
+    daemon -f "$0" "$M"
+    exit 0
+fi
+
+# Whatever happens below - error, signal, kill - the UI must not be left stuck
+# mid-switch. Clearing the pending flag is the one thing that must always run.
+trap 'eww update snitch_pending="" >/dev/null 2>&1' EXIT HUP INT TERM
+
+eww update snitch_pending="$M"
+doas -n pfsnitch mode "$M" >/dev/null 2>&1
+
+# Confirm the policy file actually says what we asked. This proves the write
+# landed; the daemon adopts it within a second of that (it watches the mtime).
+i=0
+while [ "$i" -lt 20 ]; do
+    [ "$(pfsnitch mode 2>/dev/null)" = "$M" ] && break
+    sleep 0.1
+    i=$((i + 1))
+done
+
+# The switch is effectively instant - the loop above exits on its first
+# iteration - so without a deliberate hold the feedback would be a sub-frame
+# flicker nobody perceives. Hold for roughly one and a half pulses of the CSS
+# animation, which reads as "something happened" without dragging.
+sleep 1.0
+
+# Both in ONE call: the status update re-renders the button, and anything left
+# to do after that is at the mercy of whatever eww does to the process.
+eww update snitch="$("$(dirname "$0")/pfsnitch-status")" snitch_pending=""

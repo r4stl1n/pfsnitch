@@ -1,0 +1,57 @@
+#!/bin/sh
+# pfsnitch-panic - get the network back, unconditionally.
+#
+# Run this from a TTY if pfsnitch has locked the machine out. It is
+# deliberately dumb: no arguments, no options, no dependencies beyond base, and
+# it does not try to be clever about which failure it is fixing.
+#
+# The one thing it must never do is leave the machine filtered. Note that
+# reloading /etc/pf.conf is NOT a rescue any more: that ruleset blocks outbound
+# and depends on the pfsnitch anchor to re-open it, and anchor contents survive
+# a main-ruleset reload. Reloading pf while the daemon is dead would leave
+# divert rules pointing at a socket nobody holds - every matching packet
+# silently dropped. So this disables pf outright instead.
+
+echo "pfsnitch-panic: restoring network"
+
+# 1. Stop the service, the daemon and the watchdog, so nothing re-installs
+#    rules the moment we clear them. The watchdog first: it exists to react to
+#    a missing daemon, and we are about to create exactly that condition.
+if [ -x /usr/local/etc/rc.d/pfsnitch ]; then
+	/usr/local/etc/rc.d/pfsnitch stop >/dev/null 2>&1
+fi
+pkill -f pfsnitch-watchdog >/dev/null 2>&1 && echo "  watchdog stopped"
+if pgrep -x pfsnitch >/dev/null 2>&1; then
+	pkill -x pfsnitch 2>/dev/null
+	sleep 1
+	pkill -9 -x pfsnitch 2>/dev/null
+fi
+pkill -f "daemon: pfsnitch" >/dev/null 2>&1
+echo "  pfsnitch stopped"
+
+# 2. Empty the anchor. With no daemon, its divert rules are a black hole.
+pfctl -a pfsnitch -F rules >/dev/null 2>&1 && echo "  pfsnitch anchor flushed"
+
+# 3. Disable pf entirely. /etc/pf.conf blocks outbound by design, so leaving pf
+#    enabled - even with a clean anchor - keeps the machine off the network.
+#    This is the step that actually gets you back.
+pfctl -d >/dev/null 2>&1 && echo "  pf DISABLED (machine is now unfiltered)"
+
+# 4. Historical: earlier versions used ipfw, whose default rule is deny-all.
+#    Harmless if it was never loaded.
+if sysctl -n net.inet.ip.fw.enable >/dev/null 2>&1; then
+	sysctl net.inet.ip.fw.enable=0 >/dev/null 2>&1
+	ipfw -f flush >/dev/null 2>&1
+	ipfw add 65534 allow ip from any to any >/dev/null 2>&1
+	echo "  ipfw disabled and flushed"
+fi
+kldunload ipfw >/dev/null 2>&1 && echo "  ipfw.ko unloaded"
+
+echo
+echo "  state now:"
+printf '    pf    : '; pfctl -s info 2>/dev/null | head -1 || echo "unknown"
+printf '    daemon: '; pgrep -x pfsnitch >/dev/null 2>&1 && echo "STILL RUNNING" || echo "stopped"
+printf '    route : '; netstat -rn -f inet 2>/dev/null | awk '/^default/{print $2; f=1} END{if(!f) print "NO DEFAULT ROUTE"}'
+echo
+echo "  to put the firewall back:  service pfsnitch start"
+echo "  (that re-enables pf and reloads the anchor)"

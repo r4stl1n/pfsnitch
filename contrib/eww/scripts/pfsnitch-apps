@@ -1,0 +1,12 @@
+#!/bin/sh
+# Rules grouped by application, for the management panel.
+#
+# The grouping is done by pfsnitch itself rather than here, so every frontend
+# groups identically and this stays a one-line pass-through.
+#
+# Only the panel reads this, and eww polls a var only while a window using it is
+# open - so it costs nothing until the panel is on screen.
+set -u
+OUT=$(pfsnitch apps --json 2>/dev/null | tr -d '\n')
+[ -n "$OUT" ] || OUT='{"apps":[]}'
+printf '%s\n' "$OUT"

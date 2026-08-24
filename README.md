@@ -1,0 +1,179 @@
+# pfsnitch
+
+Per-application outbound firewall for FreeBSD. Every outbound connection is
+intercepted **before it leaves**, attributed to the binary that made it, and
+allowed, blocked, or asked about.
+
+Little Snitch's model, built on `pf(4)` divert sockets and `libprocstat`.
+
+![The connection prompt](docs/img/prompt.png)
+
+The prompt shows what actually matters: which binary, which PID, the hostname it
+asked for, and the address that name resolved to. The connection is held — not
+buffered — while you decide; TCP's own SYN retransmission carries it, so
+answering within ~60s lets the connection succeed normally.
+
+## Two modes
+
+![Switching mode](docs/img/switching.png)
+
+| mode | behaviour |
+|---|---|
+| **visibility** | Watch and learn. Every packet is reinjected; new destinations are *recorded* as allow rules. No prompts. |
+| **enforcement** | Unapproved connections are dropped, and you are prompted for anything new. |
+
+Run visibility for a while, review what it learned, delete what you did not
+want, then switch. The mode lives in the policy file, so switching takes effect
+in under a second with **no restart** — there is never a window where the divert
+socket is down and traffic passes unwatched.
+
+```sh
+pfsnitch mode enforcement
+```
+
+## Rules are per-binary
+
+![The management panel](docs/img/panel.png)
+
+Rules are grouped by the binary they belong to, shown as a full path with the
+directory dimmed - `/tmp/git` and `/usr/local/bin/git` are different programs
+and must not look alike. The **i** button opens the details of the binary a rule
+points at:
+
+![Binary details](docs/img/appinfo.png)
+
+A standing permission is attached to a path, so the questions that matter are
+whether that path still exists, whether it has changed since you approved it,
+and whether anyone but root can replace it. A missing binary, a setuid bit, or
+group- or world-write permission is called out in red rather than left to be
+inferred from a mode string.
+
+Approving `github.com` for `git` does not open it for everything else on the
+machine. Blocking one destination leaves the app otherwise working — an app that
+phones a metrics endpoint loses the metrics endpoint, not the network.
+
+| kind | matches |
+|---|---|
+| `allow-host-from` / `deny-host-from` | a hostname, **for one binary** |
+| `allow-dest-from` / `deny-dest-from` | one address, **for one binary** |
+| `allow-app` / `deny-app` | one binary, every destination |
+| `allow-host` / `deny-host` / `allow-dest` | any binary — for real infrastructure (a resolver, a gateway) |
+
+Hostname rules are preferred over addresses because they survive round-robin
+DNS: one rule covers every address a site answers on, instead of re-prompting
+for each rotating CDN address.
+
+A scoped deny is the most specific rule there is, so it beats every broader
+allow — including `allow-app` for that same binary. Otherwise approving a host
+for one program would silently re-open it for one you had blocked.
+
+## Managing it
+
+```sh
+pfsnitch apps                    # rules grouped by application
+pfsnitch rules                   # flat list
+pfsnitch status                  # daemon, mode, counts
+
+pfsnitch allow host github.com --from /usr/local/bin/git
+pfsnitch deny  host metrics.example.com --from /usr/local/bin/someapp
+pfsnitch rm    deny-host-from metrics.example.com /usr/local/bin/someapp
+```
+
+The policy file is plain text, keeps its comments, and is **re-read within a
+second of any change** — by the CLI, an editor, or a script. Nothing needs to
+signal the daemon.
+
+## The desktop widget is optional
+
+![The bar chip](docs/img/bar-chip.png)
+
+The bundled eww panel is one frontend, not a requirement. Nothing in the daemon
+knows it exists. Every command above takes `--json`, and the prompt is just a
+program with a fixed contract:
+
+```
+argv:   EXE PID COMMAND DST DPORT [HOSTNAME]
+stdout: one word — allow-conn | allow-app | block-conn | block-app | timeout
+```
+
+Point `pfsnitch_prompt` at any executable honouring that. Four backends ship:
+`eww`, `tty` (console/headless), `file` (publishes JSON for any UI to answer),
+and `deny` (unattended). See [docs/FRONTENDS.md](docs/FRONTENDS.md).
+
+## Nothing escapes before the daemon is up
+
+`pf.conf` blocks outbound and relies on the `pfsnitch` anchor to re-open it. At
+boot the anchor has never been loaded, so it is empty and **no outbound traffic
+is permitted at all** until pfsnitch is actually running.
+
+Inbound SSH and DHCP renewal are passed explicitly, so a machine whose daemon
+fails to start is still reachable to fix rather than stranded.
+
+See [docs/SAFETY.md](docs/SAFETY.md) for the failure modes, including what the
+watchdog does when a running daemon dies.
+
+## How it works
+
+pf hands the packet to userspace and waits — `pf.conf` diverts outbound TCP SYNs
+and DNS to a divert socket, and the daemon decides:
+
+```
+outbound SYN ──▶ pf anchor ──▶ divert socket ──▶ pfsnitch
+                                                    │
+                          libprocstat: 4-tuple ─────┤ which binary?
+                          DNS cache:    address ────┤ which hostname?
+                          policy:       decide  ────┤
+                                                    ▼
+                                        reinject or drop
+```
+
+Policy is keyed on the **executable path**, never the process name — a name is
+trivially spoofable and the kernel truncates it to 19 characters anyway.
+
+Hostnames come from snooping plaintext DNS replies. DNS-over-HTTPS is invisible
+to this, and such connections appear as bare addresses.
+
+## Install
+
+FreeBSD, `pf` enabled. `libc` is the only build dependency — deliberately, for a
+firewall.
+
+```sh
+cargo build --release
+doas ./install.sh
+```
+
+The installer stops short of touching `/etc/pf.conf` or starting anything: this
+tool sits in the packet path, and that last step should be a decision you make
+while looking at the machine. It prints the three remaining commands.
+
+Start in `visibility` and watch what it learns before you enforce anything.
+
+If it ever locks you out, `pfsnitch-panic` is in `PATH`, takes no arguments, and
+disables pf outright.
+
+## Layout
+
+```
+src/            the daemon and CLI
+rc.d/           service script
+libexec/        prompt backends and the watchdog
+bin/            pfsnitch-answer, pfsnitch-panic
+etc/            anchor rules, and samples for pf.conf and policy.conf
+contrib/eww/    the desktop widget - one frontend, not a requirement
+docs/           the integration contract and the safety model
+```
+
+`src/procstat_sys.rs` is checked in rather than generated at build time, which
+is what keeps `libc` the only dependency. To regenerate it after a libprocstat
+change:
+
+```sh
+bindgen src/wrapper.h -o src/procstat_sys.rs \
+  --allowlist-function 'procstat_.*' --allowlist-type '(procstat|filestat|sockstat|kinfo_proc).*'
+```
+
+## Docs
+
+- [docs/FRONTENDS.md](docs/FRONTENDS.md) — the integration contract: rules, verdicts, prompts, JSON
+- [docs/SAFETY.md](docs/SAFETY.md) — failure modes, fail-open vs fail-closed, boot behaviour, scope

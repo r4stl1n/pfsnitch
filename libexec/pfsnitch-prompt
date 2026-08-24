@@ -1,0 +1,45 @@
+#!/bin/sh
+# pfsnitch-prompt EXE PID COMMAND DST DPORT [HOSTNAME]
+#
+# Picks a prompt backend and hands off. This indirection is what keeps the
+# daemon independent of any particular desktop: it always execs one program
+# with a fixed contract, and which program that is stays a configuration
+# question rather than a code change.
+#
+# Choose explicitly with PFSNITCH_PROMPT_BACKEND=eww|tty|file|deny, or point
+# the `prompt` directive in policy.conf straight at any executable of your own.
+#
+# Auto-detection order, most specific first:
+#   eww   - a Wayland session is running and can draw a real dialog
+#   tty   - somebody is logged in on a terminal to answer
+#   file  - nobody is here, but a frontend may be watching pending.json
+#
+# `deny` is never chosen automatically; it is opt-in for unattended machines.
+# The daemon is started by rc.d with PATH=/sbin:/bin:/usr/sbin:/usr/bin - no
+# /usr/local/bin, which is where eww and every other port lives. A prompt must
+# not depend on how its caller was launched, so set a complete PATH here rather
+# than inherit one and fail silently.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+set -u
+BACKEND="${PFSNITCH_PROMPT_BACKEND:-auto}"
+LIBEXEC=/usr/local/libexec
+
+if [ "$BACKEND" = auto ]; then
+    if pgrep -x Hyprland >/dev/null 2>&1; then
+        BACKEND=eww
+    elif who 2>/dev/null | grep -q .; then
+        BACKEND=tty
+    else
+        BACKEND=file
+    fi
+fi
+
+TARGET="$LIBEXEC/pfsnitch-prompt-$BACKEND"
+if [ ! -x "$TARGET" ]; then
+    # An unusable backend must not become an accidental allow or a hang.
+    echo timeout
+    exit 0
+fi
+exec "$TARGET" "$@"

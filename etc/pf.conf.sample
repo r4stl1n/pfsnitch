@@ -1,0 +1,33 @@
+# Minimal /etc/pf.conf for pfsnitch.
+#
+# The important part is that outbound is BLOCKED and the pfsnitch anchor is what
+# re-opens it. At boot the anchor has never been loaded, so it is empty and
+# nothing outbound is permitted until the daemon is actually running - there is
+# no window in which this machine makes connections nobody is watching.
+
+ext_if = "em0"          # <-- your external interface
+
+set skip on lo0
+
+block in all
+
+# Fail closed. anchor.conf ends with `pass out all keep state`, so traffic is
+# re-opened only once pfsnitch has installed its rules.
+block out all
+
+# ...except what the machine needs to have a network at all. DHCP renewal has to
+# work even with pfsnitch down, or the lease expires and the interface goes away
+# - taking any remote session with it.
+pass out quick on $ext_if proto udp from port 68 to port 67 keep state
+
+pass in inet proto icmp icmp-type { echoreq, unreach, timex }
+
+# Divert rules are loaded into this anchor by the rc.d script. Keeping them in
+# an anchor is what lets the watchdog swap them out in one command.
+anchor "pfsnitch"
+
+# Inbound SSH is admitted here and its replies match state, so a remote session
+# survives even with everything outbound blocked. If pfsnitch fails to start,
+# the machine is still reachable to fix rather than stranded.
+pass in on $ext_if proto tcp to port 22 keep state
+pass in on $ext_if proto udp from port 67 to port 68 keep state

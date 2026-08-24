@@ -1,0 +1,15 @@
+#!/bin/sh
+# Expand one application group in the panel, or collapse it if already open.
+#
+# Done in a script rather than inline in the yuck because the toggle needs to
+# read the current value first, and nesting the quotes for that inside an
+# :onclick string is unreadable and easy to get subtly wrong.
+set -u
+CUR=$(eww get snitch_open 2>/dev/null)
+if [ "$CUR" = "${1:-}" ]; then
+    # NOT "" - that is the catch-all group's own key, so collapsing an app
+    # would silently expand the global group instead of closing everything.
+    eww update snitch_open="::none::"
+else
+    eww update snitch_open="${1:-}"
+fi

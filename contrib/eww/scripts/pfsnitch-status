@@ -1,0 +1,36 @@
+#!/bin/sh
+# Bar chip state for pfsnitch. No privileges and no daemon contact - the chip
+# has to render for a normal user, so everything here is readable by anyone.
+set -u
+
+# Liveness comes from the process table; the MODE comes from the policy file,
+# which is authoritative now that it can be switched at runtime. Reading mode
+# from the daemon's argv would show whatever it was *started* with and go stale
+# the moment anyone toggles it.
+RUNNING=false
+P=$(pgrep -x pfsnitch 2>/dev/null | head -1)
+if [ -n "$P" ]; then
+    # Check argv, not just the name: `pfsnitch mode` (run two lines below)
+    # matches a bare name check and would report the daemon as up when it isn't.
+    case " $(ps -o args= -p "$P" 2>/dev/null) " in
+        *" enforcement "*|*" enforce "*|*" visibility "*|*" listen "*) RUNNING=true ;;
+    esac
+fi
+
+MODE=$(pfsnitch mode 2>/dev/null)
+[ "$RUNNING" = true ] || MODE=off
+
+case "$MODE" in
+enforcement) LABEL=enf; ICON=$(printf '\357\204\262'); LEVEL=armed
+             TIP="enforcement - unapproved connections are blocked, and prompt" ;;
+visibility)  LABEL=vis; ICON=$(printf '\357\201\256'); LEVEL=observe
+             TIP="visibility - learning what this machine talks to; nothing is blocked" ;;
+*)           MODE=off; LABEL=off; ICON=$(printf '\357\201\261'); LEVEL=down
+             TIP="pfsnitch is not running" ;;
+esac
+
+TOTAL=$(pfsnitch status --json 2>/dev/null | sed -n 's/.*"total":\([0-9]*\).*/\1/p')
+: "${TOTAL:=0}"
+
+printf '{"running":%s,"mode":"%s","label":"%s","icon":"%s","level":"%s","total":%s,"tip":"%s"}\n' \
+    "$RUNNING" "$MODE" "$LABEL" "$ICON" "$LEVEL" "$TOTAL" "$TIP"

@@ -1,0 +1,88 @@
+# pfsnitch-prompt-common - sourced by every prompt backend. Not executable.
+#
+# THE PROMPT CONTRACT
+#
+#   argv:   EXE PID COMMAND DST DPORT [HOSTNAME]
+#   stdout: one word - allow-conn | allow-app | block-conn | block-app | timeout
+#   exit:   0
+#
+# Any executable honouring that contract can be a prompt: point the `prompt`
+# directive in policy.conf (or $PFSNITCH_PROMPT) at it. Nothing here is specific
+# to a desktop, a toolkit, or a display server - that is the whole point.
+#
+# A backend that cannot ask the user must print `timeout`, never `block`. The
+# difference matters: `timeout` is deliberately NOT persisted as a rule, so an
+# unattended machine drops the packet without permanently blocking an
+# application nobody was there to judge.
+
+STATE=/var/run/pfsnitch
+ANSWER="$STATE/answer"
+NONCEF="$STATE/nonce"
+PENDING="$STATE/pending.json"
+
+EXE="${1:-?}"; PID="${2:-?}"; CMD="${3:-?}"; DST="${4:-?}"; DPORT="${5:-?}"; HOST="${6:--}"
+
+# Minimal JSON string escaping: backslash and quote only. The values are paths,
+# process names and hostnames, so control characters are not a realistic input,
+# but an unescaped quote in a path would still produce invalid JSON.
+jesc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+# Mint a nonce and publish the request where any frontend can read it.
+#
+# The nonce is what stops a stale answer being reused: without it, an answer
+# left behind by an abandoned prompt would be consumed by the NEXT prompt,
+# approving a connection with a click the user made about something else.
+pf_init() {
+    mkdir -p "$STATE" 2>/dev/null
+    chgrp wheel "$STATE" 2>/dev/null; chmod 0770 "$STATE" 2>/dev/null
+    rm -f "$ANSWER" 2>/dev/null
+
+    NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    printf '%s' "$NONCE" > "$NONCEF" 2>/dev/null
+    chmod 0660 "$NONCEF" 2>/dev/null
+
+    cat > "$PENDING" 2>/dev/null <<JSON
+{"nonce":"$(jesc "$NONCE")","exe":"$(jesc "$EXE")","pid":"$(jesc "$PID")","command":"$(jesc "$CMD")","dst":"$(jesc "$DST")","dport":"$(jesc "$DPORT")","hostname":"$(jesc "$HOST")"}
+JSON
+    chmod 0660 "$PENDING" 2>/dev/null
+}
+
+# Wait for an answer carrying our nonce. Echoes the verdict, or `timeout`.
+#
+# 60s by default: net.inet.tcp.keepinit is 75000 ms, so an answer inside this
+# window still lands while the SYN is being retried, and the connection then
+# succeeds rather than failing.
+pf_wait() {
+    _limit=${1:-120}
+    _i=0
+    while [ "$_i" -lt "$_limit" ]; do
+        if [ -s "$ANSWER" ]; then
+            _line=$(cat "$ANSWER" 2>/dev/null)
+            _got=${_line%% *}
+            _ans=${_line#* }
+            rm -f "$ANSWER" 2>/dev/null
+            if [ "$_got" = "$NONCE" ]; then
+                case "$_ans" in
+                allow-conn|allow-app|block-conn|block|block-app) printf "%s\n" "$_ans"; return 0 ;;
+                esac
+            fi
+            # Nonce mismatch: an answer meant for a different prompt. Discard it
+            # and keep waiting rather than act on someone else's consent.
+        fi
+        sleep 0.5
+        _i=$((_i + 1))
+    done
+    printf 'timeout\n'
+    return 0
+}
+
+pf_cleanup() { rm -f "$PENDING" "$NONCEF" 2>/dev/null; }
+
+# A one-line human description of the request, shared by the text backends.
+pf_describe() {
+    if [ "$HOST" = "-" ] || [ -z "$HOST" ]; then
+        printf '%s (pid %s) -> %s port %s' "$CMD" "$PID" "$DST" "$DPORT"
+    else
+        printf '%s (pid %s) -> %s [%s] port %s' "$CMD" "$PID" "$HOST" "$DST" "$DPORT"
+    fi
+}

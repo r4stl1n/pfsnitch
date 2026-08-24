@@ -1,0 +1,12 @@
+[package]
+name    = "pfsnitch"
+version = "0.1.0"
+edition = "2021"
+description = "Pre-connection egress control for FreeBSD: intercept, attribute to a process, ask."
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+panic     = "abort"      # a half-dead daemon holding a divert socket is worse than none

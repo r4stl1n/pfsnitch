@@ -1,0 +1,41 @@
+# pfsnitch policy.
+#
+# Plain text on purpose: the daemon re-reads this within a second of any change,
+# so editing it by hand works exactly as well as `pfsnitch allow ...`. Comments
+# and layout are preserved when the tool rewrites it.
+
+# What to do about a connection no rule covers.
+#   ask   - prompt (enforcement) or learn it (visibility)
+#   allow - permit silently
+#   deny  - refuse silently
+default ask
+
+# mode visibility|enforcement
+#
+# visibility  - decide and log every connection, but reinject it. New
+#               destinations are recorded as allow rules rather than prompted
+#               for, so the policy learns what this machine talks to.
+# enforcement - actually drop what is not approved, and prompt for the rest.
+#
+# Set here rather than on the command line so it can be changed at runtime with
+# no restart, and therefore no gap where traffic passes unfiltered.
+mode visibility
+
+# Which program asks the user. Any executable honouring the documented contract
+# works - argv is "EXE PID COMMAND DST DPORT [HOSTNAME]" and it prints one of
+# allow-conn|allow-app|block-conn|block-app|timeout. Overridden by $PFSNITCH_PROMPT.
+# prompt /usr/local/libexec/pfsnitch-prompt-tty
+
+# --- infrastructure -------------------------------------------------------
+# Unscoped rules match every binary. That is right for things every program
+# legitimately needs, and wrong for everything else.
+
+# allow-dest 192.168.1.1        # your gateway
+# allow-dest 8.8.8.8            # your resolver
+
+# --- per-application ------------------------------------------------------
+# Destination first, then the binary: a hostname can never contain whitespace
+# but a path can, so splitting on the first space is only unambiguous this way.
+
+# allow-host-from github.com          /usr/local/bin/git
+# deny-host-from  telemetry.example.com /usr/local/bin/someapp

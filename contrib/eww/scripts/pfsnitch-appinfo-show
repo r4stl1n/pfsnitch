@@ -1,0 +1,23 @@
+#!/bin/sh
+# pfsnitch-appinfo-show <path>  - fill the app info window and raise it.
+#
+# Detached for the same reason pfsnitch-setmode is: eww reaps the child of an
+# :onclick when the widget re-renders, and pushing the data re-renders. Without
+# this the window would sometimes open with the previous app's details, or not
+# open at all.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+if [ "${PFSNITCH_DETACHED:-0}" != 1 ]; then
+    PFSNITCH_DETACHED=1
+    export PFSNITCH_DETACHED
+    daemon -f "$0" "${1:-}"
+    exit 0
+fi
+
+D=$(dirname "$0")
+# Data first, then raise: opening first would show the previous binary's
+# details for a frame, which on a security panel is worse than a slower click.
+eww update snitch_appinfo="$("$D/pfsnitch-appinfo" "${1:-}")"
+eww open appinfo

@@ -1,0 +1,26 @@
+#!/bin/sh
+# pfsnitch-answer VERDICT
+#
+# Answer the pending prompt. Call this from ANY frontend - eww buttons, a TUI,
+# a web handler, a keybinding, a shell. It writes "<nonce> <verdict>" where the
+# waiting prompt backend can see it.
+#
+# The nonce matters: without it a stale answer left by an abandoned prompt would
+# be consumed by the NEXT prompt, silently approving a connection with a click
+# the user made about something else. The backend only accepts an answer whose
+# nonce matches the prompt it actually raised.
+set -u
+case "${1:-}" in
+allow-conn|allow-app|block-conn|block|block-app) ;;
+*)
+    echo "usage: pfsnitch-answer allow-conn|allow-app|block-conn|block-app" >&2
+    echo "  the pending request is in /var/run/pfsnitch/pending.json" >&2
+    exit 64 ;;
+esac
+NONCE=$(cat /var/run/pfsnitch/nonce 2>/dev/null)
+printf '%s %s\n' "${NONCE:-none}" "$1" > /var/run/pfsnitch/answer 2>/dev/null
+
+# Best-effort UI dismissal. Any frontend that has a window to close can close
+# it here, but none is required - the backend closes its own on the way out.
+command -v eww >/dev/null 2>&1 && eww close lfprompt >/dev/null 2>&1
+exit 0

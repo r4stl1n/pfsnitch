@@ -1,0 +1,62 @@
+#!/bin/sh
+# pfsnitch-watchdog - notice a dead daemon and decide what the network does.
+#
+# Since pf.conf now blocks outbound and relies on the pfsnitch anchor to
+# re-open it, an EMPTY anchor means "no traffic". So failing open is no longer
+# done by flushing the anchor - it is done by loading failopen.conf into it.
+# Flushing is now the fail-CLOSED action. Getting these the wrong way round
+# would either strand the machine or silently drop the firewall, so the mode is
+# explicit rather than implied.
+#
+#   open   - load failopen.conf: traffic flows unfiltered, machine keeps working
+#   closed - flush the anchor: nothing outbound until pfsnitch is back
+#
+# Boot is always closed regardless of this setting, because the anchor starts
+# empty: nothing has connected yet, so blocking costs nothing and guarantees no
+# unseen traffic. This setting only governs what happens when a RUNNING daemon
+# dies, where stranding a working machine is a real cost.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+FAILMODE="${PFSNITCH_FAILMODE:-open}"
+FAILOPEN="${PFSNITCH_FAILOPEN:-/usr/local/etc/pfsnitch/failopen.conf}"
+
+INTERVAL=2
+MISSES=0
+THRESHOLD=3        # ~6s of absence before acting
+
+while :; do
+    if pgrep -x pfsnitch >/dev/null 2>&1; then
+        MISSES=0
+    else
+        MISSES=$((MISSES + 1))
+        if [ "$MISSES" -ge "$THRESHOLD" ]; then
+            case "$FAILMODE" in
+            closed)
+                if pfctl -a pfsnitch -s rules 2>/dev/null | grep -q .; then
+                    pfctl -a pfsnitch -F rules >/dev/null 2>&1
+                    logger -t pfsnitch-watchdog "daemon gone; anchor flushed (failed CLOSED - no outbound)"
+                fi
+                ;;
+            *)
+                # Only act if the anchor still holds divert rules; once it is
+                # already the fail-open ruleset there is nothing left to do,
+                # and re-loading it every 6s would just spam the log.
+                if pfctl -a pfsnitch -s rules 2>/dev/null | grep -q divert; then
+                    if pfctl -a pfsnitch -f "$FAILOPEN" >/dev/null 2>&1; then
+                        logger -t pfsnitch-watchdog "daemon gone; anchor set to fail-open (traffic unfiltered)"
+                    else
+                        # If that load fails we must not leave divert rules
+                        # pointing at a socket nobody is holding.
+                        pfctl -a pfsnitch -F rules >/dev/null 2>&1
+                        logger -t pfsnitch-watchdog "daemon gone; failopen.conf unreadable, anchor flushed (no outbound)"
+                    fi
+                fi
+                ;;
+            esac
+            MISSES=0
+        fi
+    fi
+    sleep "$INTERVAL"
+done

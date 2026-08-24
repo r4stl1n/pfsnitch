@@ -1,0 +1,47 @@
+#!/bin/sh
+# pfsnitch-prompt-eww EXE PID COMMAND DST DPORT [HOSTNAME]
+#
+# Ask via an eww window on the user's Wayland session.
+#
+# Uses an eww window rather than a desktop notification: mako advertises the
+# "actions" capability but does NOT render action buttons - they are reachable
+# only via `makoctl menu` plus a separate picker, which is unusable for a
+# security prompt.
+#
+# The daemon runs as root; eww belongs to the user's session. Env is read from
+# the running compositor and privileges dropped with su. HOME must be set
+# explicitly: `su -m` preserves root's HOME, which sends eww looking for a
+# config in /root and silently failing.
+# The daemon is started by rc.d with PATH=/sbin:/bin:/usr/sbin:/usr/bin - no
+# /usr/local/bin, which is where eww and every other port lives. A prompt must
+# not depend on how its caller was launched, so set a complete PATH here rather
+# than inherit one and fail silently.
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+set -u
+. /usr/local/libexec/pfsnitch-prompt-common
+
+HYPRPID=$(pgrep -x Hyprland 2>/dev/null | head -1)
+[ -n "$HYPRPID" ] || { echo timeout; exit 0; }
+SESSUSER=$(ps -o user= -p "$HYPRPID" 2>/dev/null | tr -d ' ')
+[ -n "$SESSUSER" ] || { echo timeout; exit 0; }
+SESSHOME=$(getent passwd "$SESSUSER" 2>/dev/null | cut -d: -f6)
+
+envof() { procstat -e "$HYPRPID" 2>/dev/null | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
+XDG=$(envof XDG_RUNTIME_DIR)
+DBUS=$(envof DBUS_SESSION_BUS_ADDRESS)
+
+asuser() {
+    su -m "$SESSUSER" -c \
+      "env PATH='$PATH' HOME='$SESSHOME' XDG_RUNTIME_DIR='$XDG' DBUS_SESSION_BUS_ADDRESS='$DBUS' WAYLAND_DISPLAY=wayland-1 $1" \
+      >/dev/null 2>&1
+}
+
+pf_init
+asuser "eww update lf_exe='$EXE' lf_pid='$PID' lf_cmd='$CMD' lf_dst='$DST' lf_dport='$DPORT' lf_host='$HOST'"
+asuser "eww open lfprompt"
+ANS=$(pf_wait 120)
+asuser "eww close lfprompt"
+pf_cleanup
+printf '%s\n' "$ANS"
