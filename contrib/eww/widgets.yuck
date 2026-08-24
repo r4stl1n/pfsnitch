@@ -143,7 +143,7 @@
                         :tooltip {snitch_armed == g.app
                                   ? "click again to remove every rule for this binary"
                                   : "remove every rule for this binary"}
-                        :onclick "~/.config/eww/scripts/pfsnitch-forget ''"
+                        :onclick "~/.config/eww/scripts/pfsnitch-forget '${g.app}'"
                   {snitch_armed == g.app ? "sure?" : ""})))
 
             ;; Rendered only while open. eww has no way to animate this, so the
