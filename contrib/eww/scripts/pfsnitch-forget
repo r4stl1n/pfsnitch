@@ -1,0 +1,34 @@
+#!/bin/sh
+# pfsnitch-forget <binary>  - arm, then confirm, then remove all its rules.
+#
+# Two stages on purpose. This discards every decision made about a binary, it
+# cannot be undone from the panel, and it sits one button away from a harmless
+# info control. A single misclick should not be able to throw away a policy
+# built up over weeks.
+#
+# Detached for the same reason the other helpers are: eww reaps the child of an
+# :onclick when the widget re-renders, and arming re-renders.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+if [ "${PFSNITCH_DETACHED:-0}" != 1 ]; then
+    PFSNITCH_DETACHED=1
+    export PFSNITCH_DETACHED
+    daemon -f "$0" "${1:-}"
+    exit 0
+fi
+
+APP="${1:-}"
+[ -n "$APP" ] || exit 0
+
+if [ "$(eww get snitch_armed 2>/dev/null)" = "$APP" ]; then
+    doas -n pfsnitch forget "$APP" >/dev/null 2>&1
+    eww update snitch_armed=""
+else
+    eww update snitch_armed="$APP"
+    # Disarm itself. A destructive button left armed is a trap for whatever the
+    # next click happens to be.
+    sleep 4
+    [ "$(eww get snitch_armed 2>/dev/null)" = "$APP" ] && eww update snitch_armed=""
+fi

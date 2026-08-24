@@ -47,6 +47,10 @@
 ;; Details of whichever binary the info button was last pressed on. Filled on
 ;; click rather than polled - none of it changes second to second, and hashing
 ;; a binary on a timer would be a silly thing to do to a laptop.
+;; The app whose "remove all rules" button is armed. Two-stage because the
+;; action is bulk, irreversible from the panel, and next to a harmless button.
+(defvar snitch_armed "")
+
 (defvar snitch_appinfo '{"path":"","name":"","kind":"global"}')
 
 (defwidget w_snitch []
@@ -130,7 +134,17 @@
                       :tooltip "binary details"
                       :onclick "~/.config/eww/scripts/pfsnitch-appinfo-show '${g.app}'" "")
               (label :class "cnt allow" :text "${g.allow}")
-              (label :class {g.deny > 0 ? "cnt deny" : "cnt deny zero"} :text "${g.deny}"))
+              (label :class {g.deny > 0 ? "cnt deny" : "cnt deny zero"} :text "")
+              ;; Not offered for the catch-all group: those rules belong to no
+              ;; binary and are the machine's infrastructure - a resolver, a
+              ;; gateway. "Forget them all" has no sane reading there.
+              (revealer :transition "crossfade" :duration "120ms" :reveal {g.app != ""}
+                (button :class {snitch_armed == g.app ? "forgetbtn armed" : "forgetbtn"}
+                        :tooltip {snitch_armed == g.app
+                                  ? "click again to remove every rule for this binary"
+                                  : "remove every rule for this binary"}
+                        :onclick "~/.config/eww/scripts/pfsnitch-forget ''"
+                  {snitch_armed == g.app ? "sure?" : ""})))
 
             ;; Rendered only while open. eww has no way to animate this, so the
             ;; caret is what tells you the row is expandable.

@@ -42,6 +42,7 @@ fn main() {
         "status" => cmd_status(&args),
         "mode" => cmd_mode(&args),
         "apps" => cmd_apps(&args),
+        "forget" => cmd_forget(&args),
         "help" | "-h" | "--help" => usage(0),
         other => {
             eprintln!("pfsnitch: unknown command {other:?}");
@@ -74,6 +75,7 @@ rules (any frontend can drive these - see --json):
   pfsnitch deny  host <name>  block a hostname
   pfsnitch deny  app <path>   block a binary
   pfsnitch rm <kind> <value>  remove rules, e.g. rm allow-host example.com
+  pfsnitch forget <binary>    remove every rule for one binary (keeps a backup)
 
 The policy file is plain text and is re-read automatically within a second of
 changing, so editing it by hand or from a script works exactly as well as these
@@ -855,5 +857,39 @@ fn short_dir(dir: &str, max: usize) -> String {
     match tail.find('/') {
         Some(i) => format!("\u{2026}{}", &tail[i..]),
         None => format!("\u{2026}{tail}"),
+    }
+}
+
+fn cmd_forget(args: &[String]) {
+    let exe = match args.get(2) {
+        Some(e) if !e.is_empty() => e.as_str(),
+        _ => {
+            eprintln!("usage: pfsnitch forget <binary>");
+            eprintln!("  removes every rule for that binary, and its pinned identity");
+            std::process::exit(64);
+        }
+    };
+    // The unscoped rules are not owned by any binary; they are the machine's
+    // infrastructure - a resolver, a gateway. There is no sane reading of
+    // "forget the empty string", and a plausible misreading deletes the rules
+    // keeping the box on the network.
+    if exe == "-" {
+        eprintln!("pfsnitch: refusing - unscoped rules belong to no binary");
+        eprintln!("  remove them individually with `pfsnitch rm`");
+        std::process::exit(64);
+    }
+    match policy::remove_app(Path::new(POLICY_PATH), exe) {
+        Ok((0, _)) => {
+            println!("no rules for {exe}");
+            std::process::exit(1);
+        }
+        Ok((n, backup)) => {
+            println!("removed {n} rule{} for {exe}", if n == 1 { "" } else { "s" });
+            println!("  previous policy saved as {backup}");
+        }
+        Err(e) => {
+            eprintln!("pfsnitch: {e}");
+            std::process::exit(1);
+        }
     }
 }

@@ -371,3 +371,24 @@ nothing, because it would look like real data.
 
 An unscoped rule is not owned by any binary, so its timestamp is the most recent
 time *any* binary used that destination.
+
+## Removing every rule for a binary
+
+```sh
+pfsnitch forget /usr/local/bin/someapp
+```
+
+Removes every rule belonging to that binary — scoped allows and denies,
+`allow-app`/`deny-app`, and its pinned `app-id` — and writes the previous policy
+to `policy.conf.bak` first. A rule set is not something anyone can reconstruct
+from memory.
+
+It refuses to act on the unscoped group. Those rules belong to no binary and are
+the machine's infrastructure — a resolver, a gateway — so "forget them all" has
+no sane reading, and a plausible misreading takes the box off the network.
+
+The bundled panel offers this as an `×` at the end of each application row, in
+**two stages**: the first click arms it (the button turns red and reads
+"sure?"), the second performs it, and it disarms itself after four seconds. The
+action is bulk, irreversible from the panel, and sits one button away from a
+harmless info control — a single misclick should not discard weeks of decisions.

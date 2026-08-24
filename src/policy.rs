@@ -1134,3 +1134,44 @@ impl Policy {
         self.app_id.remove(exe);
     }
 }
+
+/// Remove every rule belonging to one binary, and its pinned identity.
+///
+/// Returns how many lines went. Takes a backup first: this is the one operation
+/// that can destroy a lot of decisions at once, and a rule set is not something
+/// a user can reconstruct from memory.
+pub fn remove_app(path: &Path, exe: &str) -> io::Result<(usize, String)> {
+    let text = fs::read_to_string(path)?;
+
+    let backup = format!("{}.bak", path.display());
+    fs::write(&backup, &text)?;
+
+    let mut kept = String::new();
+    let mut removed = 0usize;
+    for raw in text.lines() {
+        let hit = match parse_line(raw) {
+            Some((k, v, _)) => match k.as_str() {
+                // The whole value is the binary.
+                "allow-app" | "deny-app" => v == exe,
+                // "<hash> <binary>" and "<destination> <binary>".
+                "app-id"
+                | "allow-host-from"
+                | "deny-host-from"
+                | "allow-dest-from"
+                | "deny-dest-from" => split_scoped(&v).map(|(_, e)| e == exe).unwrap_or(false),
+                _ => false,
+            },
+            None => false,
+        };
+        if hit {
+            removed += 1;
+            continue;
+        }
+        kept.push_str(raw);
+        kept.push('\n');
+    }
+    if removed > 0 {
+        write_atomic(path, &kept)?;
+    }
+    Ok((removed, backup))
+}
