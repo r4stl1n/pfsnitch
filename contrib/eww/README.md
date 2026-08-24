@@ -54,3 +54,37 @@ substitutes nothing, and a `\x{f00d}` re-encodes the entire file. Both have
 happened here, and both produced widgets that looked fine until someone noticed
 a missing number. Use `sed`, which does not interpolate, and pass glyph bytes
 in via `printf` under `LC_ALL=C`.
+
+## eww loses its windows, and a watchdog for it
+
+On this machine eww 0.5.0 loses its **application thread while its IPC thread
+survives**. The symptoms are confusing on purpose:
+
+- `eww ping` still answers `pong`, so the daemon looks healthy
+- `eww active-windows` lists nothing — not even the bar
+- windows already on screen are orphaned: `eww close` reports "no such window"
+  while the surface stays up, so the panel cannot be closed
+- every subsequent open/close is a silent no-op
+
+It reproduces as **open the panel, close it, open it again**. Bisecting the
+panel found no single widget at fault — header, `for` loop, `scroll`,
+`revealer`, buttons and tooltips each survive that cycle on their own, and only
+the whole panel does not. Slowing the polls to 60s, dropping every tooltip, and
+changing `:stacking` and `:focusable` all made no difference. That makes it an
+eww bug rather than a misuse of it.
+
+`scripts/eww-watchdog` mitigates it. The tell is a daemon that answers ping but
+no longer lists the bar; it restarts eww and reaps what the crash stranded —
+each one leaves a wedged `eww open` client and orphaned `deflisten` children,
+and after a few crashes there were three stuck clients and four leaked listeners
+sitting around.
+
+Recovery takes about 8 seconds, most of which is eww starting up. So the bar
+does visibly disappear and come back when this happens. That is a mitigation,
+not a fix.
+
+Start it from your compositor:
+
+```
+exec-once = daemon -f -P /tmp/eww-watchdog.pid ~/.config/eww/scripts/eww-watchdog
+```

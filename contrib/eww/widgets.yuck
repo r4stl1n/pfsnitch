@@ -128,7 +128,7 @@
                     (label :class {g.app == "" ? "appname global" : "appname"}
                            :text {g.name} :halign "start" :limit-width 22))
                   (box :hexpand true)
-                  (label :class {g.last_seen == "null" ? "lastseen never" : "lastseen"}
+                  (label :class {g.last_seen_ago == "never" ? "lastseen never" : "lastseen"}
                          :text {g.last_seen_ago})))
               (button :class "infobtn"
                       :tooltip "binary details"
@@ -161,7 +161,7 @@
                   ;; When this rule was last used. The question people actually
                   ;; ask of a rule list is whether an entry is still in use or
                   ;; left over from something they did months ago.
-                  (label :class {r.last_seen == "null" ? "lastseen never" : "lastseen"}
+                  (label :class {r.last_seen_ago == "never" ? "lastseen never" : "lastseen"}
                          :text {r.last_seen_ago})
                   (button :class "rmbtn"
                           :tooltip "remove this rule"

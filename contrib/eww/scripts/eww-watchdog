@@ -1,0 +1,58 @@
+#!/bin/sh
+# Keep eww alive.
+#
+# eww 0.5.0 on this machine loses its application thread while the IPC thread
+# survives: `eww ping` still answers pong, but every window operation becomes a
+# silent no-op and windows already on screen are orphaned - they cannot be
+# closed, only destroyed with the daemon. Opening the pfsnitch panel a second
+# time reproduces it, and bisecting the panel found no single widget at fault:
+# each piece survives alone, only the whole does not. That makes it an eww bug
+# rather than a misuse, so the answer is to supervise it.
+#
+# The tell is a daemon that answers ping but no longer lists the bar.
+set -u
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+
+INTERVAL=2
+MISSES=0
+THRESHOLD=2       # two in a row, so a restart in progress is not mistaken for a fault
+
+start_eww() {
+    # A crash strands whatever client was talking to the daemon, and orphans
+    # the deflisten children it spawned. Left alone these accumulate: three
+    # stuck `eww open` and four leaked listeners were sitting around after a
+    # handful of crashes. Reap them, or the machine slowly fills with them.
+    pkill -9 -f 'eww daemon'      >/dev/null 2>&1
+    pkill -9 -f '^eww open'       >/dev/null 2>&1
+    pkill -9 -f '^eww close'      >/dev/null 2>&1
+    pkill -9 -f 'eww update'      >/dev/null 2>&1
+    pkill -9 -f workspaces-listen >/dev/null 2>&1
+    sleep 1
+    eww daemon >/dev/null 2>&1 &
+    sleep 3
+    eww open bar >/dev/null 2>&1
+}
+
+while :; do
+    sleep "$INTERVAL"
+
+    if ! pgrep -f 'eww daemon' >/dev/null 2>&1; then
+        logger -t eww-watchdog "daemon gone; restarting"
+        start_eww
+        MISSES=0
+        continue
+    fi
+
+    # Alive but not tracking the bar = the application thread has died.
+    if eww active-windows 2>/dev/null | grep -q '^bar'; then
+        MISSES=0
+    else
+        MISSES=$((MISSES + 1))
+        if [ "$MISSES" -ge "$THRESHOLD" ]; then
+            logger -t eww-watchdog "daemon answers but has lost its windows; restarting"
+            start_eww
+            MISSES=0
+        fi
+    fi
+done
