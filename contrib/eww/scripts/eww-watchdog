@@ -1,15 +1,15 @@
 #!/bin/sh
 # Keep eww alive.
 #
-# eww 0.5.0 on this machine loses its application thread while the IPC thread
-# survives: `eww ping` still answers pong, but every window operation becomes a
-# silent no-op and windows already on screen are orphaned - they cannot be
-# closed, only destroyed with the daemon. Opening the pfsnitch panel a second
-# time reproduces it, and bisecting the panel found no single widget at fault:
-# each piece survives alone, only the whole does not. That makes it an eww bug
-# rather than a misuse, so the answer is to supervise it.
+# Restart eww if it becomes unreachable.
 #
-# The tell is a daemon that answers ping but no longer lists the bar.
+# Deliberately narrow. eww also has a separate fault - its window registry
+# desyncs from what is on screen, so `eww close` answers "no such window" for a
+# panel you are looking at - but the daemon is HEALTHY when that happens: the
+# GTK loop still runs and the clock still ticks. Restarting on that symptom
+# tears down a working bar for no reason, which is what an earlier version of
+# this script did. That fault is handled in pfsnitch-close-panel, on the path
+# where it is actually observable.
 set -u
 PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
 export PATH
@@ -44,13 +44,18 @@ while :; do
         continue
     fi
 
-    # Alive but not tracking the bar = the application thread has died.
-    if eww active-windows 2>/dev/null | grep -q '^bar'; then
+    # Only act when the daemon is genuinely unreachable. An earlier version
+    # restarted whenever `active-windows` stopped listing the bar - but that
+    # happens while the daemon is perfectly healthy and still rendering, so it
+    # was killing a working bar every time the registry desynced. A panel that
+    # will not close is handled on the close path instead, where the failure is
+    # actually observable.
+    if eww ping >/dev/null 2>&1; then
         MISSES=0
     else
         MISSES=$((MISSES + 1))
         if [ "$MISSES" -ge "$THRESHOLD" ]; then
-            logger -t eww-watchdog "daemon answers but has lost its windows; restarting"
+            logger -t eww-watchdog "daemon unreachable; restarting"
             start_eww
             MISSES=0
         fi

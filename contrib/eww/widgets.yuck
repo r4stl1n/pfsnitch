@@ -69,7 +69,7 @@
       (label :class "popup-val" :text "pfsnitch")
       (label :class "modebadge ${snitch.level}" :text {snitch.mode})
       (box :hexpand true)
-      (button :class "closebtn" :onclick "eww close secpopup" ""))
+      (button :class "closebtn" :onclick "~/.config/eww/scripts/pfsnitch-close-panel" ""))
 
     ;; A segmented pair rather than a switch: for a security setting, both
     ;; states should be readable at a glance instead of inferred from which way
