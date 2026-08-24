@@ -177,3 +177,7 @@ bindgen src/wrapper.h -o src/procstat_sys.rs \
 
 - [docs/FRONTENDS.md](docs/FRONTENDS.md) — the integration contract: rules, verdicts, prompts, JSON
 - [docs/SAFETY.md](docs/SAFETY.md) — failure modes, fail-open vs fail-closed, boot behaviour, scope
+
+## License
+
+MIT — see [LICENSE](LICENSE).
