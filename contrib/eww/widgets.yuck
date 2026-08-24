@@ -5,13 +5,16 @@
 ;; on the rest of any particular bar config.
 ;;
 ;; Styling lives in widgets.scss.
-
 (defvar lf_exe   "")
 (defvar lf_pid   "")
 (defvar lf_cmd   "")
 (defvar lf_dst   "")
 (defvar lf_dport "")
 (defvar lf_host  "-")
+;; "changed" when the binary no longer matches the one whose rules were
+;; approved. Shown prominently: a user who does not know that will just click
+;; allow, which is exactly the failure this check exists to prevent.
+(defvar lf_idstate "ok")
 
 ;; ------------------------------ widgets -----------------------------
 (defpoll snitch :interval "10s"
@@ -158,12 +161,19 @@
 
 (defwidget lfprompt_content []
   (box :class "lfprompt" :orientation "v" :space-evenly false :spacing 10
-    (label :class "lftitle" :text "Outbound connection" :halign "start")
+    (label :class {lf_idstate == "changed" ? "lftitle changed" : "lftitle"}
+           :text {lf_idstate == "changed" ? "Outbound connection - BINARY CHANGED" : "Outbound connection"}
+           :halign "start")
     (box :orientation "v" :space-evenly false :spacing 3
       (label :class "lfcmd"  :text "${lf_cmd}  [${lf_pid}]" :halign "start")
       (label :class "lfpath" :text lf_exe :halign "start" :limit-width 46)
       (label :class "lfhost" :text {lf_host == "-" ? "(no hostname seen)" : lf_host} :halign "start")
-      (label :class "lfdst"  :text "-> ${lf_dst}:${lf_dport}" :halign "start"))
+      (label :class "lfdst"  :text "-> ${lf_dst}:${lf_dport}" :halign "start")
+      (label :class {lf_idstate == "changed" ? "lfwarn on" : "lfwarn"}
+             :halign "start"
+             :text {lf_idstate == "changed"
+                    ? "This file is not the one you approved. Its rules are ignored."
+                    : ""}))
     ;; Two rows of two, so allow and block are visibly symmetric: each has a
     ;; "this destination" option and a "whole binary" option. Block defaults to
     ;; the narrow one - blocking an app's metrics endpoint should not take the

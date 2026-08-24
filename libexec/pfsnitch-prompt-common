@@ -21,6 +21,9 @@ NONCEF="$STATE/nonce"
 PENDING="$STATE/pending.json"
 
 EXE="${1:-?}"; PID="${2:-?}"; CMD="${3:-?}"; DST="${4:-?}"; DPORT="${5:-?}"; HOST="${6:--}"
+# 7th argument, optional: "changed" if the binary no longer matches the one
+# whose rules were approved. Absent for backends written before it existed.
+IDSTATE="${7:-ok}"
 
 # Minimal JSON string escaping: backslash and quote only. The values are paths,
 # process names and hostnames, so control characters are not a realistic input,
@@ -42,7 +45,7 @@ pf_init() {
     chmod 0660 "$NONCEF" 2>/dev/null
 
     cat > "$PENDING" 2>/dev/null <<JSON
-{"nonce":"$(jesc "$NONCE")","exe":"$(jesc "$EXE")","pid":"$(jesc "$PID")","command":"$(jesc "$CMD")","dst":"$(jesc "$DST")","dport":"$(jesc "$DPORT")","hostname":"$(jesc "$HOST")"}
+{"nonce":"$(jesc "$NONCE")","idstate":"$(jesc "$IDSTATE")","exe":"$(jesc "$EXE")","pid":"$(jesc "$PID")","command":"$(jesc "$CMD")","dst":"$(jesc "$DST")","dport":"$(jesc "$DPORT")","hostname":"$(jesc "$HOST")"}
 JSON
     chmod 0660 "$PENDING" 2>/dev/null
 }

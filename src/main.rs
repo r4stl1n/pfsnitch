@@ -12,6 +12,7 @@
 
 mod dns;
 mod divert;
+mod identity;
 mod policy;
 mod procinfo;
 
@@ -331,6 +332,10 @@ fn run(fallback_mode: policy::Mode) {
     let (tx, rx) = mpsc::channel::<(Answer, Pending)>();
 
     let mut res = procinfo::Resolver::new();
+    let mut ident = identity::Identity::new();
+    // Binaries already reported as changed, so the warning is loud once rather
+    // than once per retransmitted packet.
+    let mut id_warned: HashSet<String> = HashSet::new();
     let mut names = dns::DnsCache::new();
     // One prompt per (binary, destination) in flight. Without this, a browser
     // opening thirty sockets to one host would raise thirty identical prompts.
@@ -345,6 +350,17 @@ fn run(fallback_mode: policy::Mode) {
         while let Ok((ans, p)) = rx.try_recv() {
             let key = (p.exe.clone().unwrap_or_default(), p.dst);
             asking.remove(&key);
+            if let Some(e) = p.exe.as_deref() {
+                if matches!(ans, Answer::AllowConn | Answer::AllowApp) {
+                    // Re-pin: if this approval follows a change warning, the
+                    // user has just said the new binary is the one they want.
+                    pol.forget_id(e);
+                    id_warned.remove(e);
+                    if let Some(sha) = ident.hash(e) {
+                        pol.record_id(policy_path, e, &sha);
+                    }
+                }
+            }
             pol.record(policy_path, ans, p.exe.as_deref(), p.dst, p.host.as_deref(), p.dport, policy::Origin::Approved);
             eprintln!("  decision: {:?} for {} -> {}", ans, p.exe.as_deref().unwrap_or("?"), p.dst);
         }
@@ -405,7 +421,31 @@ fn run(fallback_mode: policy::Mode) {
                 let owner = res.owner(&t);
                 let exe = owner.as_ref().map(|o| o.path.clone());
                 let hostname = names.name_for(&f.dst).map(|s| s.to_string());
-                let verdict = pol.decide(exe.as_deref(), f.dst, hostname.as_deref(), f.dport);
+                // A rule is a standing permission attached to a PATH, but the file
+                // behind a path can be replaced. If the binary is not the one
+                // that was approved, the rules it earned do not apply to
+                // whatever is there now - fall back to asking.
+                let mut id_changed = false;
+                if let Some(e) = exe.as_deref() {
+                    if let Some(expected) = pol.expected_id(e).map(str::to_string) {
+                        if let Some(actual) = ident.hash(e) {
+                            if actual != expected {
+                                id_changed = true;
+                                if id_warned.insert(e.to_string()) {
+                                    eprintln!(
+                                        "pfsnitch: BINARY CHANGED {e}\n  approved {expected}\n  now      {actual}\n  its rules are being ignored until you approve it again"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let verdict = if id_changed {
+                    Verdict::Ask
+                } else {
+                    pol.decide(exe.as_deref(), f.dst, hostname.as_deref(), f.dport)
+                };
 
                 // What the log will call this. Ask becomes Learn in visibility,
                 // because nothing is being asked - we are writing the rule.
@@ -421,6 +461,7 @@ fn run(fallback_mode: policy::Mode) {
                             let host = names.name_for(&f.dst).unwrap_or("").to_string();
                             spawn_prompt(
                                 prompt_bin.clone(),
+                                id_changed,
                                 tx.clone(),
                                 exe.clone(),
                                 owner.as_ref().map(|o| o.pid).unwrap_or(0),
@@ -491,6 +532,7 @@ fn run(fallback_mode: policy::Mode) {
 /// socket while the user thinks - a blocked loop means a stalled network.
 fn spawn_prompt(
     prompt_bin: String,
+    id_changed: bool,
     tx: mpsc::Sender<(Answer, Pending)>,
     exe: Option<String>,
     pid: i32,
@@ -509,6 +551,9 @@ fn spawn_prompt(
             .arg(dst.to_string())
             .arg(dport.to_string())
             .arg(if host.is_empty() { "-".to_string() } else { host })
+            // Optional 7th argument. A backend that does not know about it just
+            // ignores it, which is why it goes last.
+            .arg(if id_changed { "changed" } else { "ok" })
             .output();
 
         let ans = match out {

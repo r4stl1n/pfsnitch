@@ -39,7 +39,7 @@ asuser() {
 }
 
 pf_init
-asuser "eww update lf_exe='$EXE' lf_pid='$PID' lf_cmd='$CMD' lf_dst='$DST' lf_dport='$DPORT' lf_host='$HOST'"
+asuser "eww update lf_exe='$EXE' lf_pid='$PID' lf_cmd='$CMD' lf_dst='$DST' lf_dport='$DPORT' lf_host='$HOST' lf_idstate='$IDSTATE'"
 asuser "eww open lfprompt"
 ANS=$(pf_wait 120)
 asuser "eww close lfprompt"

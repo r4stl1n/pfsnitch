@@ -29,7 +29,7 @@
 //!     approved name is allowed, so DNS poisoning would be honoured. Hostname
 //!     rules carry this property everywhere, Little Snitch included.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -98,6 +98,10 @@ pub struct Policy {
     /// Program used to ask the user. Configurable so that no particular
     /// desktop (or any desktop at all) is a requirement - see prompt_bin().
     prompt: Option<String>,
+    /// The hash a binary had when its rules were approved. A rule is a
+    /// standing permission attached to a path, and a path is not an identity -
+    /// this is what notices the file behind it being swapped.
+    app_id: HashMap<String, String>,
     /// Operating mode. Lives in the policy file rather than in argv so it can
     /// be changed at runtime: the daemon re-reads the file within a second, so
     /// a switch takes effect without a restart - and therefore without ever
@@ -133,6 +137,12 @@ impl Policy {
                 "allow-host" => { let (h, pt) = split_target(v); p.allow_host.insert((h.to_lowercase(), pt)); }
                 "deny-host" => { let (h, pt) = split_target(v); p.deny_host.insert((h.to_lowercase(), pt)); }
                 "prompt" => { p.prompt = Some(v.to_string()); }
+                // app-id <sha256> <path>. Destination-first for the same reason
+                // the scoped rules are: a hash has no spaces, a path might.
+                "app-id" => match split_scoped(v) {
+                    Some((sha, exe)) => { p.app_id.insert(exe, sha.to_lowercase()); }
+                    None => eprintln!("policy:{}: want `app-id <sha256> <binary>`", n + 1),
+                },
                 "mode" => match Mode::parse(v) {
                     Some(m) => p.mode = Some(m),
                     None => eprintln!("policy:{}: bad mode {v:?}", n + 1),
@@ -1095,5 +1105,32 @@ mod target_tests {
             let (h, p) = split_target(s);
             assert_eq!(join_target(&h, p), s, "round trip failed for {s}");
         }
+    }
+}
+
+impl Policy {
+    /// The hash this binary had when its rules were approved, if we recorded one.
+    pub fn expected_id(&self, exe: &str) -> Option<&str> {
+        self.app_id.get(exe).map(|s| s.as_str())
+    }
+
+    /// Remember what a binary looked like at the moment it was approved.
+    ///
+    /// Only ever recorded on an explicit approval, never on a learned rule:
+    /// visibility mode records what happened, and pinning an identity to
+    /// traffic nobody looked at would give the pin a weight it has not earned.
+    pub fn record_id(&mut self, path: &Path, exe: &str, sha: &str) {
+        if self.app_id.contains_key(exe) {
+            return;
+        }
+        self.app_id.insert(exe.to_string(), sha.to_lowercase());
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "app-id {sha}\t{exe}\t# identity when approved");
+        }
+    }
+
+    /// Forget a binary's recorded identity, so the next approval re-pins it.
+    pub fn forget_id(&mut self, exe: &str) {
+        self.app_id.remove(exe);
     }
 }
