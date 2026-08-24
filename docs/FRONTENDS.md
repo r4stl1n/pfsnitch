@@ -355,10 +355,11 @@ a frontend must not assume the rest.
  "last_seen":1787533666,"last_seen_ago":"40s ago", ...}
 ```
 
-This is deliberately **not** traffic accounting. Only the first packet of a TCP
-connection ever reaches userspace — the rest matches pf state — so byte counts
-would be UDP-only and quietly misleading about everything else. A timestamp is
-something we can observe for every protocol, and it answers the question people
+This is deliberately **not** traffic accounting, though not for the reason first
+given here: an earlier version of this document claimed only the first packet of
+a TCP connection reaches userspace. That is false - see
+[SAFETY.md](SAFETY.md#what-this-costs) - and byte counting is in fact feasible.
+It is simply not what was asked for. A timestamp answers the question people
 actually ask of a rule list: is this still in use, or left over from something I
 did months ago?
 

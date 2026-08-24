@@ -132,6 +132,18 @@ Point `pfsnitch_prompt` at any executable honouring that. Four backends ship:
 `eww`, `tty` (console/headless), `file` (publishes JSON for any UI to answer),
 and `deny` (unattended). See [docs/FRONTENDS.md](docs/FRONTENDS.md).
 
+## What it costs
+
+Every packet of every connection goes through userspace, in both directions -
+not just the connection setup. Measured on a 9 MB download over a ~35 Mbit/s
+link: 34-35 Mbit/s without pfsnitch, 27-31 Mbit/s with it, and 10,110
+diversions for the transfer.
+
+That is roughly 15 µs of CPU per packet, so a single core tops out somewhere
+near 800 Mbit/s. On a laptop the cost is real but small; on a fast link or a
+server it will limit throughput. See [docs/SAFETY.md](docs/SAFETY.md#what-this-costs)
+for why, and why the obvious fix does not work.
+
 ## Nothing escapes before the daemon is up
 
 `pf.conf` blocks outbound and relies on the `pfsnitch` anchor to re-open it. At

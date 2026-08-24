@@ -140,9 +140,11 @@ Two limits worth knowing:
 
 ## UDP, and what it costs
 
-TCP is easy: a SYN is an unambiguous "starting a connection", it is one packet
-per connection, and it retransmits for 75 s — so holding it while the user
-decides is free and reliable.
+TCP is easy to make a DECISION about: a SYN is an unambiguous "starting a
+connection", and it retransmits for 75 s, so holding it while the user decides
+is reliable. That is about the decision, not about the cost - see
+[what this costs](#what-this-costs) below, because both protocols are dearer
+than they look.
 
 UDP has none of that, and pfsnitch originally diverted **only DNS**. Everything
 else — QUIC/HTTP3 on port 443 above all, plus NTP, mDNS, WireGuard — flowed
@@ -177,3 +179,48 @@ and it should be a choice you make knowingly rather than a default you inherit.
 ICMP, and any IP protocol that is neither TCP nor UDP, are not diverted. They
 are also not "an application connecting somewhere" in the sense this tool
 models, but a determined tunnel could use them.
+
+## What this costs
+
+Measured, not estimated, on a 9 MB HTTP download over a ~35 Mbit/s link:
+
+| | throughput | diversions | daemon CPU |
+|---|---|---|---|
+| pfsnitch out of the path | 34–35 Mbit/s | — | — |
+| pfsnitch in the path | 27–31 Mbit/s | **10,110** | ~0.15 s |
+
+**Every packet of every connection goes through userspace, in both
+directions** — not just the SYN. 10,110 diversions for a 9 MB transfer is
+approximately its entire packet count.
+
+The reason is that `divert-to` combined with `keep state` stores the divert
+action *in the pf state*. Once that state exists, every packet matching it is
+diverted, and pf states are bidirectional, so inbound data is diverted too.
+`keep state` prevents later packets re-evaluating other rules; it does not
+exempt them from the divert.
+
+That works out at roughly **15 µs of CPU per packet**, which puts a
+single-core ceiling somewhere near 800 Mbit/s at a 1500-byte MTU. On this link
+the cost is a 10–20% throughput reduction. On a gigabit link the daemon would be
+the bottleneck, and on a busy server it would be a serious one.
+
+### Why not divert only the SYN
+
+The obvious fix is `no state` on the TCP divert rule, so only the SYN matches and
+everything else falls through to the catch-all. **It does not work**, and it
+fails in a way worth recording: the SYN is consumed by the quick divert rule, no
+state is ever created, and the returning SYN-ACK therefore has nothing to match
+and is dropped by `block in all`. Tested: the transfer stalled for the full 75 s
+of SYN retransmission and then failed.
+
+The outbound `keep state` is not incidental — it is what admits the return
+traffic. Any scheme for reducing the per-packet cost has to create that state
+some other way, for instance by having the daemon add approved flows to a pf
+table that is passed before the divert rule. That is unimplemented.
+
+### What this means in practice
+
+- On a laptop on domestic broadband, the cost is real but small.
+- On a fast link or a server, this design will limit throughput.
+- If that matters more to you than seeing traffic, the TCP and UDP divert rules
+  in `anchor.conf` are one line each and are documented for removal.
