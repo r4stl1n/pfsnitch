@@ -399,6 +399,10 @@ fn run(fallback_mode: policy::Mode) {
         };
 
         let mut allow = true;
+        // Distinct from !allow: a packet held while a prompt is open must be
+        // dropped silently, because its retransmission is what carries the
+        // connection until the user answers. Only a settled deny is rejected.
+        let mut reject = false;
 
         if let Some(f) = divert::parse(&buf[..n]) {
             // DNS answers teach us hostnames. Handled before the verdict
@@ -453,7 +457,7 @@ fn run(fallback_mode: policy::Mode) {
 
                 match verdict {
                     Verdict::Allow => allow = true,
-                    Verdict::Deny => allow = false,
+                    Verdict::Deny => { allow = false; reject = true; }
                     Verdict::Ask if mode.enforcing() => {
                         allow = false; // hold it: the SYN will be retried
                         let key = (exe.clone().unwrap_or_default(), f.dst);
@@ -520,6 +524,16 @@ fn run(fallback_mode: policy::Mode) {
             }
         }
         // Observe mode never drops: that is the entire point of having it.
+        if mode.enforcing() && reject {
+            // Tell the application no, now, the way a closed port would. Left to
+            // time out instead, a blocked connection reads as a broken network
+            // rather than a decision - 75 seconds of nothing by default.
+            if let Some(rst) = divert::tcp_rst(&buf[..n]) {
+                if let Err(e) = d.reinject_inbound(&rst) {
+                    eprintln!("reset: {e}");
+                }
+            }
+        }
         if !mode.enforcing() || allow {
             if let Err(e) = d.reinject(&buf[..n], &from) {
                 eprintln!("reinject: {e}");

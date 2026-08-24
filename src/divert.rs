@@ -325,6 +325,77 @@ mod tests {
         assert!(f.syn_only);
     }
 
+    /// A checksum is correct exactly when summing the whole thing yields zero.
+    /// Checking that is stronger than comparing against a value I computed the
+    /// same way the code does.
+    fn sums_to_zero(parts: &[&[u8]]) -> bool {
+        csum(parts) == 0
+    }
+
+    #[test]
+    fn v4_rst_has_valid_ip_and_tcp_checksums() {
+        let mut p = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
+        p.extend_from_slice(&[10, 0, 0, 2]);
+        p.extend_from_slice(&[93, 184, 216, 34]);
+        p.extend_from_slice(&tcp(41000, 443, 0x02));
+        let r = tcp_rst(&p).expect("a SYN should get a reset");
+
+        assert_eq!(r.len(), 40);
+        assert!(sums_to_zero(&[&r[..20]]), "IP header checksum is wrong");
+
+        let pseudo = [93, 184, 216, 34, 10, 0, 0, 2, 0, 6, 0, 20];
+        assert!(sums_to_zero(&[&pseudo, &r[20..]]), "TCP checksum is wrong");
+    }
+
+    #[test]
+    fn v4_rst_is_addressed_back_to_the_sender() {
+        let mut p = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
+        p.extend_from_slice(&[10, 0, 0, 2]);
+        p.extend_from_slice(&[93, 184, 216, 34]);
+        p.extend_from_slice(&tcp(41000, 443, 0x02));
+        let r = tcp_rst(&p).unwrap();
+
+        assert_eq!(&r[12..16], &[93, 184, 216, 34], "reset must come FROM the peer");
+        assert_eq!(&r[16..20], &[10, 0, 0, 2], "and go TO the local end");
+        assert_eq!(u16::from_be_bytes([r[20], r[21]]), 443, "source port is the peer's");
+        assert_eq!(u16::from_be_bytes([r[22], r[23]]), 41000);
+        assert_eq!(r[33] & 0x04, 0x04, "RST flag must be set");
+        // A SYN consumes one sequence number, so the reset acknowledges seq+1.
+        assert_eq!(u32::from_be_bytes([r[28], r[29], r[30], r[31]]), 1);
+    }
+
+    #[test]
+    fn v6_rst_has_a_valid_tcp_checksum() {
+        let p = v6(6, &tcp(41000, 443, 0x02));
+        let r = tcp_rst(&p).expect("a v6 SYN should get a reset");
+        assert_eq!(r.len(), 60);
+
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&r[8..24]);
+        pseudo.extend_from_slice(&r[24..40]);
+        pseudo.extend_from_slice(&20u32.to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 6]);
+        assert!(sums_to_zero(&[&pseudo, &r[40..]]), "v6 TCP checksum is wrong");
+        assert_eq!(r[40 + 13] & 0x04, 0x04);
+    }
+
+    #[test]
+    fn an_rst_is_never_answered_with_another_rst() {
+        // Otherwise two hosts can bounce resets off each other forever.
+        let mut p = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0];
+        p.extend_from_slice(&[10, 0, 0, 2]);
+        p.extend_from_slice(&[93, 184, 216, 34]);
+        p.extend_from_slice(&tcp(41000, 443, 0x04));
+        assert!(tcp_rst(&p).is_none());
+    }
+
+    #[test]
+    fn udp_gets_no_reset() {
+        let mut udp = vec![0x00, 0x35, 0x00, 0x35, 0, 8, 0, 0];
+        udp.extend_from_slice(b"x");
+        assert!(tcp_rst(&v6(17, &udp)).is_none());
+    }
+
     #[test]
     fn truncated_and_garbage_packets_are_rejected_not_panicked_on() {
         assert!(parse(&[]).is_none());
@@ -333,5 +404,154 @@ mod tests {
         assert!(parse(&[0x00; 60]).is_none(), "version 0 is neither family");
         // v6 header claiming hop-by-hop but with nothing after it
         assert!(parse(&v6(0, &[])).is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rejection.
+//
+// Dropping an unapproved SYN makes the application wait out TCP's own timeout -
+// 75 seconds by default. That is the right behaviour while a prompt is open,
+// because the retransmissions are what carry the connection until the user
+// answers. It is the wrong behaviour for a settled `deny`: the application
+// should be told no, immediately, the way a closed port would tell it.
+//
+// So a definitive deny synthesises an RST from the remote end and hands it back
+// to the local stack.
+// ---------------------------------------------------------------------------
+
+/// Ones-complement sum used by both the IP and TCP checksums.
+fn csum(parts: &[&[u8]]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut carry_byte: Option<u8> = None;
+
+    for part in parts {
+        let mut i = 0;
+        // A part may have odd length, in which case its last byte pairs with the
+        // first byte of the next part - the sum is over the concatenation, not
+        // over each piece separately.
+        if let Some(hi) = carry_byte.take() {
+            if !part.is_empty() {
+                sum += u16::from_be_bytes([hi, part[0]]) as u32;
+                i = 1;
+            } else {
+                carry_byte = Some(hi);
+            }
+        }
+        while i + 1 < part.len() {
+            sum += u16::from_be_bytes([part[i], part[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < part.len() {
+            carry_byte = Some(part[i]);
+        }
+    }
+    if let Some(hi) = carry_byte {
+        sum += u16::from_be_bytes([hi, 0]) as u32;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Build a TCP RST that answers `pkt`, addressed back to whoever sent it.
+///
+/// Returns None for anything that is not a TCP segment we should be resetting -
+/// notably an RST itself, which must never be answered with another.
+pub fn tcp_rst(pkt: &[u8]) -> Option<Vec<u8>> {
+    let h = l3(pkt)?;
+    if h.proto != 6 || pkt.len() < h.l4 + 20 {
+        return None;
+    }
+    let flags = pkt[h.l4 + 13];
+    if (flags & 0x04) != 0 {
+        return None; // never answer an RST with an RST
+    }
+
+    let sport = u16::from_be_bytes([pkt[h.l4], pkt[h.l4 + 1]]);
+    let dport = u16::from_be_bytes([pkt[h.l4 + 2], pkt[h.l4 + 3]]);
+    let seq = u32::from_be_bytes([
+        pkt[h.l4 + 4],
+        pkt[h.l4 + 5],
+        pkt[h.l4 + 6],
+        pkt[h.l4 + 7],
+    ]);
+
+    // A SYN consumes one sequence number, so the reset acknowledges seq+1.
+    let ack = seq.wrapping_add(if (flags & 0x02) != 0 { 1 } else { 0 });
+
+    let mut tcp = Vec::with_capacity(20);
+    tcp.extend_from_slice(&dport.to_be_bytes()); // ports swap: this comes FROM the peer
+    tcp.extend_from_slice(&sport.to_be_bytes());
+    tcp.extend_from_slice(&0u32.to_be_bytes()); // seq
+    tcp.extend_from_slice(&ack.to_be_bytes());
+    tcp.push(0x50); // data offset 5 words, no options
+    tcp.push(0x14); // RST | ACK
+    tcp.extend_from_slice(&0u16.to_be_bytes()); // window 0
+    tcp.extend_from_slice(&0u16.to_be_bytes()); // checksum, filled below
+    tcp.extend_from_slice(&0u16.to_be_bytes()); // urgent pointer
+
+    match (h.src, h.dst) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => {
+            let (so, de) = (d.octets(), s.octets()); // swapped
+            let pseudo = [
+                so[0], so[1], so[2], so[3], de[0], de[1], de[2], de[3], 0, 6, 0, 20,
+            ];
+            let ck = csum(&[&pseudo, &tcp]);
+            tcp[16..18].copy_from_slice(&ck.to_be_bytes());
+
+            let mut ip = Vec::with_capacity(40);
+            ip.push(0x45);
+            ip.push(0);
+            ip.extend_from_slice(&40u16.to_be_bytes());
+            ip.extend_from_slice(&0u16.to_be_bytes()); // id
+            ip.extend_from_slice(&0u16.to_be_bytes()); // flags/frag
+            ip.push(64); // ttl
+            ip.push(6);
+            ip.extend_from_slice(&0u16.to_be_bytes()); // header checksum
+            ip.extend_from_slice(&so);
+            ip.extend_from_slice(&de);
+            let hc = csum(&[&ip]);
+            ip[10..12].copy_from_slice(&hc.to_be_bytes());
+            ip.extend_from_slice(&tcp);
+            Some(ip)
+        }
+        (IpAddr::V6(s), IpAddr::V6(d)) => {
+            let (so, de) = (d.octets(), s.octets()); // swapped
+            let mut pseudo = Vec::with_capacity(40);
+            pseudo.extend_from_slice(&so);
+            pseudo.extend_from_slice(&de);
+            pseudo.extend_from_slice(&20u32.to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0, 6]);
+            let ck = csum(&[&pseudo, &tcp]);
+            tcp[16..18].copy_from_slice(&ck.to_be_bytes());
+
+            let mut ip = Vec::with_capacity(60);
+            ip.extend_from_slice(&[0x60, 0, 0, 0]);
+            ip.extend_from_slice(&20u16.to_be_bytes()); // payload length
+            ip.push(6); // next header
+            ip.push(64); // hop limit
+            ip.extend_from_slice(&so);
+            ip.extend_from_slice(&de);
+            ip.extend_from_slice(&tcp);
+            Some(ip)
+        }
+        _ => None, // a packet cannot have mismatched families
+    }
+}
+
+impl Divert {
+    /// Hand a packet to the LOCAL stack as though it had arrived from outside.
+    ///
+    /// The kernel reads a zero sin_addr as "send this outbound" and anything
+    /// else as "deliver this inbound" (ip_divert.c), so the address here only
+    /// has to be non-zero - it is a direction flag, not a destination.
+    pub fn reinject_inbound(&self, pkt: &[u8]) -> io::Result<()> {
+        let mut sa: libc::sockaddr_in = unsafe { mem::zeroed() };
+        sa.sin_len = mem::size_of::<libc::sockaddr_in>() as u8;
+        sa.sin_family = libc::AF_INET as u8;
+        sa.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+        self.reinject(pkt, &sa)
     }
 }
