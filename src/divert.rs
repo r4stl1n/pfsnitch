@@ -34,9 +34,31 @@ impl Divert {
     /// Bind a divert socket to `port`. Requires root.
     pub fn bind(port: u16) -> io::Result<Self> {
         unsafe {
-            let fd = libc::socket(PF_DIVERT, libc::SOCK_RAW, 0);
+            // SOCK_CLOEXEC is not optional here.
+            //
+            // Without it this descriptor is inherited by every process the
+            // daemon execs - and the daemon execs the prompt, which execs eww,
+            // which daemonises and spawns the whole user bar. The observed
+            // result: `eww`, `socat`, `wpa_cli` and assorted shell scripts, all
+            // running as an unprivileged user, holding fd 3 open on a root
+            // divert socket. That is a privilege leak - those processes can read
+            // and inject raw packets - and it also pins the port, so the daemon
+            // can never rebind and `service pfsnitch restart` fails with
+            // EADDRINUSE, leaving an empty anchor and a blocked network.
+            //
+            // std's sockets set this by default; this one is raw libc, so it
+            // must be asked for explicitly.
+            let fd = libc::socket(PF_DIVERT, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0);
             if fd < 0 {
                 return Err(io::Error::last_os_error());
+            }
+
+            // Belt and braces: if a kernel ever ignores SOCK_CLOEXEC in the type
+            // argument, set the flag directly rather than silently leaking again.
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                let e = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
             }
 
             let mut addr: libc::sockaddr_in = mem::zeroed();
