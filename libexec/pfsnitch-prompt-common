@@ -72,14 +72,26 @@ pf_wait() {
             _line=$(cat "$ANSWER" 2>/dev/null)
             _got=${_line%% *}
             _ans=${_line#* }
-            rm -f "$ANSWER" 2>/dev/null
             if [ "$_got" = "$NONCE" ]; then
+                # Ours: consume it so no later prompt can reuse this consent.
+                rm -f "$ANSWER" 2>/dev/null
                 case "$_ans" in
                 allow-conn|allow-app|block-conn|block|block-app) printf "%s\n" "$_ans"; return 0 ;;
                 esac
             fi
-            # Nonce mismatch: an answer meant for a different prompt. Discard it
-            # and keep waiting rather than act on someone else's consent.
+            # Not ours - LEAVE IT ALONE.
+            #
+            # This used to `rm` before comparing, which quietly broke every case
+            # where two prompts were open at once. One application resolving to
+            # several addresses raises one prompt per address; whichever waiter
+            # polled first destroyed the answer, and if that was not the prompt
+            # the user actually clicked, the click did nothing at all and both
+            # requests timed out. It presented as "allow does not work" with no
+            # error anywhere, and it is a coin flip, so it looked intermittent.
+            #
+            # A stale answer left here cannot be misapplied: it only matches the
+            # nonce that produced it, and pf_init removes it before minting a new
+            # one.
         fi
         sleep 0.5
         _i=$((_i + 1))

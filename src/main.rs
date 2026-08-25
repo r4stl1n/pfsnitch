@@ -353,7 +353,15 @@ fn run(fallback_mode: policy::Mode) {
     let mut names = dns::DnsCache::new();
     // One prompt per (binary, destination) in flight. Without this, a browser
     // opening thirty sockets to one host would raise thirty identical prompts.
-    let mut asking: HashSet<(String, IpAddr)> = HashSet::new();
+    //
+    // Keyed on the HOSTNAME when one is known, not the address. Keying on the
+    // address raised a separate prompt per A record, so a single `curl
+    // example.org` produced four prompt processes - and because they share one
+    // nonce and one answer file, the newest overwrote the nonce and the rest
+    // became unanswerable. The rule that gets written is `allow-host-from`,
+    // which already covers every address the name resolves to, so the extra
+    // prompts asked a question whose answer was going to cover them anyway.
+    let mut asking: HashSet<(String, String)> = HashSet::new();
     // Flows already written to the log. See the note at the println below.
     let mut logged: HashSet<(u8, IpAddr, u16, IpAddr, u16)> = HashSet::new();
     // Settled verdicts, keyed on the flow. See the note in the packet loop.
@@ -364,7 +372,7 @@ fn run(fallback_mode: policy::Mode) {
     loop {
         // Drain any answers first so policy is current before the next verdict.
         while let Ok((ans, p)) = rx.try_recv() {
-            let key = (p.exe.clone().unwrap_or_default(), p.dst);
+            let key = (p.exe.clone().unwrap_or_default(), ask_key(p.host.as_deref(), p.dst));
             asking.remove(&key);
             if let Some(e) = p.exe.as_deref() {
                 if matches!(ans, Answer::AllowConn | Answer::AllowApp) {
@@ -540,9 +548,12 @@ fn run(fallback_mode: policy::Mode) {
                         Verdict::Deny => { allow = false; reject = true; }
                         Verdict::Ask if mode.enforcing() => {
                             allow = false; // hold it: the SYN will be retried
-                            let key = (exe.clone().unwrap_or_default(), f.dst);
+                            let host = names.name_for(&f.dst).unwrap_or("").to_string();
+                            let key = (
+                                exe.clone().unwrap_or_default(),
+                                ask_key(if host.is_empty() { None } else { Some(&host) }, f.dst),
+                            );
                             if asking.insert(key) {
-                                let host = names.name_for(&f.dst).unwrap_or("").to_string();
                                 spawn_prompt(
                                     prompt_bin.clone(),
                                     id_changed,
@@ -633,6 +644,19 @@ fn run(fallback_mode: policy::Mode) {
                 eprintln!("reinject: {e}");
             }
         }
+    }
+}
+
+/// What counts as "the same question" for prompt de-duplication.
+///
+/// The hostname when we have one, because the approval is written as
+/// `allow-host-from` and covers every address behind that name. Falling back to
+/// the address is right only when no name was seen - then the address really is
+/// the identity of the destination.
+fn ask_key(host: Option<&str>, dst: IpAddr) -> String {
+    match host {
+        Some(h) if !h.is_empty() && h != "-" => h.to_lowercase(),
+        _ => dst.to_string(),
     }
 }
 
@@ -971,5 +995,71 @@ fn cmd_clear(args: &[String]) {
             eprintln!("pfsnitch: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_key_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    /// The regression. One name behind several A records must be ONE question:
+    /// per-address keys raised a prompt per record, and because the prompts share
+    /// a nonce and an answer file, all but the newest became unanswerable and the
+    /// click did nothing.
+    #[test]
+    fn one_name_on_many_addresses_is_one_question() {
+        let a = ask_key(Some("example.org"), ip(104, 20, 26, 136));
+        let b = ask_key(Some("example.org"), ip(172, 66, 157, 237));
+        assert_eq!(a, b);
+    }
+
+    /// The approval is written as allow-host-from, which covers the whole name,
+    /// so collapsing them does not approve anything the user was not asked about.
+    #[test]
+    fn different_names_stay_separate() {
+        assert_ne!(
+            ask_key(Some("example.org"), ip(1, 2, 3, 4)),
+            ask_key(Some("example.com"), ip(1, 2, 3, 4))
+        );
+    }
+
+    /// With no name the address IS the identity of the destination.
+    #[test]
+    fn without_a_name_the_address_is_the_key() {
+        assert_eq!(ask_key(None, ip(1, 2, 3, 4)), "1.2.3.4");
+        assert_ne!(ask_key(None, ip(1, 2, 3, 4)), ask_key(None, ip(1, 2, 3, 5)));
+    }
+
+    /// The prompt contract uses "-" for "no hostname seen", and the empty string
+    /// turns up wherever a name was looked up and missed. Neither is a name, and
+    /// treating them as one would collapse every unnamed destination into a
+    /// single question.
+    #[test]
+    fn placeholder_hostnames_are_not_names() {
+        assert_eq!(ask_key(Some("-"), ip(1, 2, 3, 4)), "1.2.3.4");
+        assert_eq!(ask_key(Some(""), ip(1, 2, 3, 4)), "1.2.3.4");
+        assert_ne!(ask_key(Some("-"), ip(1, 2, 3, 4)), ask_key(Some("-"), ip(5, 6, 7, 8)));
+    }
+
+    /// DNS is case-insensitive; the rule is written lowercased. If the key were
+    /// not, one host would ask twice.
+    #[test]
+    fn names_are_matched_case_insensitively() {
+        assert_eq!(
+            ask_key(Some("Example.ORG"), ip(1, 2, 3, 4)),
+            ask_key(Some("example.org"), ip(9, 9, 9, 9))
+        );
+    }
+
+    /// v6 and v4 for one name are still that one name.
+    #[test]
+    fn address_family_does_not_split_a_name() {
+        let v6: IpAddr = "2606:2800:220:1::248".parse().unwrap();
+        assert_eq!(ask_key(Some("example.org"), v6), ask_key(Some("example.org"), ip(1, 2, 3, 4)));
     }
 }
