@@ -30,6 +30,12 @@ load_rc_config $name
 #   open   - restore unfiltered traffic, keep the machine working
 #   closed - no outbound at all until pfsnitch is back
 : ${pfsnitch_failmode:="open"}
+: ${pfsnitch_failopen:="/usr/local/etc/pfsnitch/failopen.conf"}
+
+# The divert(4) port the daemon binds and anchor.conf points at. Only needed
+# here so start can tell you WHO is squatting it instead of failing with a bare
+# EADDRINUSE.
+: ${pfsnitch_divert_port:="8668"}
 
 # Which program asks the user about a new connection, and which backend that
 # program picks. Either may be left empty: the daemon then falls back to the
@@ -60,8 +66,45 @@ stop_postcmd="pfsnitch_poststop"
 # Note that a plain `pfctl -f /etc/pf.conf` does NOT need this: anchor contents
 # are a separate ruleset and survive a main-ruleset reload. Only an explicit
 # flush, or a boot where the anchor has never been loaded, empties it.
-extra_commands="reload"
+extra_commands="reload anchor"
 reload_cmd="pfsnitch_reload"
+anchor_cmd="pfsnitch_load_anchor"
+
+# Put the anchor into a defined state when the daemon is not there to serve it.
+#
+# There is no safe "do nothing" here. An EMPTY anchor means no outbound at all,
+# because pf.conf blocks out and relies on this anchor to re-open it; and LEAVING
+# divert rules means every packet is handed to a socket nobody holds, which drops
+# them just the same. So a failure has to pick one deliberately, and say which.
+pfsnitch_failsafe() {
+    case "${pfsnitch_failmode}" in
+    closed)
+        pfctl -a pfsnitch -F rules >/dev/null 2>&1
+        warn "$1: anchor flushed - FAILED CLOSED, no outbound until pfsnitch starts"
+        logger -t pfsnitch "$1: failed closed"
+        ;;
+    *)
+        if pfctl -a pfsnitch -f "${pfsnitch_failopen}" >/dev/null 2>&1; then
+            warn "$1: anchor set to fail-open - TRAFFIC IS UNFILTERED until pfsnitch starts"
+            logger -t pfsnitch "$1: failed open, traffic unfiltered"
+        else
+            pfctl -a pfsnitch -F rules >/dev/null 2>&1
+            warn "$1: ${pfsnitch_failopen} unreadable; anchor flushed - no outbound"
+            logger -t pfsnitch "$1: failopen unreadable, failed closed"
+        fi
+        ;;
+    esac
+}
+
+# Who currently holds the divert port, other than us.
+pfsnitch_divert_squatters() {
+    # sockstat columns: USER COMMAND PID FD PROTO LOCAL FOREIGN.
+    # Match the divert protocol specifically - a TCP listener that happens to sit
+    # on the same number is not a conflict and must not block the start.
+    sockstat -4 2>/dev/null \
+        | awk -v want=":${pfsnitch_divert_port}\$" \
+              '$5 == "div4" && $6 ~ want { print "    " $1 " " $2 " (pid " $3 ", fd " $4 ")" }'
+}
 
 pfsnitch_prestart() {
     # pfsnitch enforces through pf rules, so a disabled pf means the daemon is
@@ -75,6 +118,26 @@ pfsnitch_prestart() {
     if ! kldstat -q -m ipdivert; then
         kldload ipdivert || { warn "cannot load ipdivert"; return 1; }
     fi
+
+    # Bail out BEFORE touching the anchor if the port is already taken.
+    #
+    # This ordering is the whole point. Flushing first and then failing to bind
+    # is what turns a failed start into a network outage: the daemon never comes
+    # up, the anchor is empty, pf.conf blocks out, and no watchdog is running yet
+    # to notice. Aborting here leaves whatever was working still working.
+    #
+    # It also names the culprit. A leaked descriptor in some unrelated desktop
+    # process presents as a bare EADDRINUSE, which tells you nothing about where
+    # to look.
+    squat=$(pfsnitch_divert_squatters)
+    if [ -n "$squat" ]; then
+        warn "divert port ${pfsnitch_divert_port} is already held; refusing to start"
+        warn "the anchor has NOT been touched - existing rules are still in place"
+        echo "$squat"
+        warn "stop those processes (or run: service pfsnitch stop) and try again"
+        return 1
+    fi
+
     # never start with stale rules in place
     pfctl -a pfsnitch -F rules >/dev/null 2>&1
 }
@@ -89,12 +152,17 @@ pfsnitch_poststart() {
         n=$((n + 1))
     done
     if ! pgrep -x pfsnitch >/dev/null 2>&1; then
-        warn "pfsnitch did not start; NOT installing divert rules"
+        warn "pfsnitch did not start; see /var/log/pfsnitch.log"
+        # prestart flushed the anchor, so doing nothing here leaves an empty
+        # anchor under a block-out pf.conf - a dead network with nothing running
+        # to repair it, because the watchdog below never gets started either.
+        pfsnitch_failsafe "pfsnitch failed to start"
         return 1
     fi
     pfctl -a pfsnitch -f "${pfsnitch_anchor}" || {
         warn "anchor failed to load; stopping daemon to avoid a half state"
         pkill -x pfsnitch
+        pfsnitch_failsafe "anchor failed to load"
         return 1
     }
     # `&` alone leaves stdout attached to the rc script, and `service` then
@@ -161,6 +229,28 @@ pfsnitch_reload() {
         return 1
     }
     echo "Reloaded pfsnitch anchor."
+}
+
+# Reconcile the anchor with the daemon. Safe to run at any time.
+#
+# `start` on an already-running daemon is a no-op inside rc.subr: it reports
+# "already running" and never reaches poststart, so an anchor left empty by an
+# earlier failed start stays empty even once the daemon is healthy again. That
+# combination - firewall up, anchor empty, pf.conf blocking out - is a dead
+# network that neither start nor restart will fix, and it is exactly the state
+# this command exists to get out of.
+pfsnitch_load_anchor() {
+    if pgrep -x pfsnitch >/dev/null 2>&1; then
+        pfctl -a pfsnitch -f "${pfsnitch_anchor}" || {
+            warn "anchor failed to load from ${pfsnitch_anchor}"
+            return 1
+        }
+        echo "pfsnitch anchor loaded ($(pfctl -a pfsnitch -s rules 2>/dev/null | wc -l | tr -d ' ') rules, daemon running)."
+    else
+        warn "pfsnitch is not running - not installing divert rules"
+        pfsnitch_failsafe "anchor requested while pfsnitch is down"
+        return 1
+    fi
 }
 
 pfsnitch_poststop() {

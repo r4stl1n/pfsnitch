@@ -26,10 +26,39 @@ INTERVAL=2
 MISSES=0
 THRESHOLD=3        # ~6s of absence before acting
 
+ANCHOR="${PFSNITCH_ANCHOR:-/usr/local/etc/pfsnitch/anchor.conf}"
+STRANDED=0
+STRANDED_THRESHOLD=3   # ~6s, so a normal start is never raced
+
 while :; do
     if pgrep -x pfsnitch >/dev/null 2>&1; then
         MISSES=0
+
+        # The daemon is alive but the anchor is not diverting to it. That is a
+        # half state, and which half depends on how it happened: an anchor left
+        # empty by a failed start means NO outbound at all, while a fail-open
+        # ruleset from an earlier crash means traffic is flowing UNFILTERED. The
+        # first looks like a dead network, the second like a working one with no
+        # firewall - and nothing else notices either.
+        #
+        # `service pfsnitch start` will not fix it. rc.subr sees a running daemon,
+        # reports "already running" and never reaches the step that loads the
+        # anchor. So the reconcile has to live here.
+        if pfctl -a pfsnitch -s rules 2>/dev/null | grep -q divert; then
+            STRANDED=0
+        else
+            STRANDED=$((STRANDED + 1))
+            if [ "$STRANDED" -ge "$STRANDED_THRESHOLD" ]; then
+                if pfctl -a pfsnitch -f "$ANCHOR" >/dev/null 2>&1; then
+                    logger -t pfsnitch-watchdog "daemon healthy but anchor had no divert rules; reloaded $ANCHOR"
+                else
+                    logger -t pfsnitch-watchdog "daemon healthy but anchor is empty and $ANCHOR will not load - NETWORK MAY BE DOWN"
+                fi
+                STRANDED=0
+            fi
+        fi
     else
+        STRANDED=0
         MISSES=$((MISSES + 1))
         if [ "$MISSES" -ge "$THRESHOLD" ]; then
             case "$FAILMODE" in
