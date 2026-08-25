@@ -441,6 +441,29 @@ fn run(fallback_mode: policy::Mode) {
                 continue;
             }
 
+            // An INBOUND packet is not a connection attempt, and must never be
+            // judged as one.
+            //
+            // pf stores the divert action in the state, and states are
+            // bidirectional, so replies come back through here too. The tuple is
+            // then reversed - the reply to a QUIC request reads as
+            // `<server>:443 -> 10.0.0.2:<ephemeral>`, an "outbound connection" to
+            // our own address on a port no process is listening on. Nothing owns
+            // that, so it prompted, and approving it wrote
+            // `allow-dest 10.0.0.2:<ephemeral>` - a machine-wide rule naming this
+            // host on a port that never recurs. 33 such rules had accumulated,
+            // every one of them already dead: `last: never`, because an ephemeral
+            // port is not reused.
+            //
+            // Judging the outbound direction is what enforcement means; the reply
+            // was already decided when its flow was. Unsolicited inbound cannot
+            // reach here anyway - pf.conf blocks in before this anchor, and the
+            // only inbound divert rule is for DNS answers, handled above.
+            if from.sin_addr.s_addr != 0 {
+                if let Err(e) = d.reinject(&buf[..n], &from) { eprintln!("reinject: {e}"); }
+                continue;
+            }
+
             if f.syn_only || f.proto == 17 {
                 // pf diverts EVERY packet of a flow, in both directions - the
                 // divert action lives in the pf state, not just on the rule. So
@@ -469,12 +492,11 @@ fn run(fallback_mode: policy::Mode) {
                     let t = procinfo::Tuple {
                         proto: f.proto, src: f.src, sport: f.sport, dst: f.dst, dport: f.dport,
                     };
-                    // sin_addr == 0 means the kernel wants this sent outbound;
-                    // anything else is an inbound delivery. The weak attribution
-                    // tiers key on the packet's SOURCE as the local end, which is
-                    // only true outbound - see procinfo::Tables::get.
-                    let outbound = from.sin_addr.s_addr == 0;
-                    let att = res.resolve(&t, outbound);
+                    // Everything reaching here is outbound: inbound was
+                    // reinjected above. The flag stays explicit because the weak
+                    // attribution tiers key on the packet's SOURCE as the local
+                    // end, which is only true outbound - see procinfo::Tables::get.
+                    let att = res.resolve(&t, true);
                     let owner = att.as_ref().map(|a| a.owner.clone());
                     let exe = owner.as_ref().map(|o| o.path.clone());
                     // "none" is not just a weaker "local": it is what turns an
