@@ -17,9 +17,18 @@ Every phase must survive the stress/fuzz harness under the debug kernel
 |---|---|---|
 | 1 | Attribution oracle | **Done** — tested under INVARIANTS/WITNESS |
 | 2 | In-kernel verdict cache (cached deny → EPERM at connect) | **Done** — tested under INVARIANTS/WITNESS |
-| 3 | Blocking upcall — retire the SYN-retransmit hold | Next |
-| 4 | Retire divert; close the UDP / DNS gaps | Planned |
-| 5 | Failmode, policy sync, productionization | Planned |
+| 3 | Blocking upcall — retire the SYN-retransmit hold | **Not feasible via the MAC hook** — see below |
+| 4 | Retire divert; close the UDP / DNS gaps | **Blocked** by Phase 3; divert is load-bearing |
+| 5 | Failmode, policy sync (of the Phase 2 cache) | Still worthwhile |
+
+> **Where the kernel route actually tops out.** Phases 1–2 ship: exact,
+> race-free attribution and a fast in-kernel *deny* at connect. Phase 3 as
+> designed is **not buildable** (the reason is below), and because it is the
+> thing that would let divert be retired, Phase 4 falls with it. So this MAC
+> `socket_check_connect` route does **not** remove the per-packet divert
+> overhead that started this — divert stays as the hold-and-miss mechanism.
+> Addressing that overhead needs a different lever (the pf state-bypass, or a
+> `pfil(9)`-based redesign), out of scope here.
 
 **Phase 2 as built** enforces only the *deny* side in the hook — a cached deny
 fails `connect()` with `EPERM`, before any packet. A cached allow and a miss
@@ -92,33 +101,42 @@ before the next connection.
 
 ---
 
-## Phase 3 — Blocking upcall
+## Phase 3 — Blocking upcall — NOT FEASIBLE via this hook
 
-**Goal.** Replace the drop-and-retransmit hold (see `docs/` Fig 3 / the
-SYN-retransmit note) with a genuinely blocked syscall, so a prompt no longer
-relies on TCP retrying.
+**The idea was:** on a cache miss, block the connecting thread in the hook until
+the daemon answers (or fail-fast with `EAGAIN` for non-blocking sockets, the
+chosen policy), replacing the drop-and-SYN-retransmit hold.
 
-**Kernel work.**
-- On a cache miss, post an event (tuple + owning identity) to the daemon over the
-  cdev and `msleep` the connecting thread with a bounded timeout; wake it when
-  the daemon writes the verdict back, then insert into the Phase 2 cache and
-  return `0`/`EPERM`.
-- A default action for timeout and for “no daemon listening”, from the failmode
-  (Phase 5).
+**Why it cannot be built.** `mac_socket_check_connect` is dispatched by
+`MAC_POLICY_CHECK_NOSLEEP` (`security/mac/mac_internal.h`), which walks the
+dynamic policy list under an **rmlock read lock** (`mac_policy_slock_nosleep`,
+an `rm_priotracker`). A dynamically-loaded policy's hook therefore runs holding
+that non-sleepable lock, and **`msleep`/`tsleep`/`cv_wait` there is illegal** —
+it panics under INVARIANTS ("sleeping thread owns a non-sleepable lock"). It is
+irrelevant that `kern_connectat` itself holds no socket lock at the call site;
+the framework's own dispatch lock is the blocker. There is no sleepable
+connect-check entry point to use instead.
 
-**Flow change.** The connection is *held in the syscall*, not dropped — works for
-UDP too, which the retransmit trick never could. The divert path is no longer the
-mechanism for unknown flows.
+**And it is not needed.** The existing divert + SYN-retransmit path already
+provides the hold, correctly, for both socket kinds:
+- a **blocking** connect sleeps in the kernel's *own* connect-wait loop
+  (`msleep(&so->so_timeo, …)` in `kern_connectat`, legally, outside any MAC
+  lock) while the SYN is dropped and retransmitted until the user answers;
+- a **non-blocking** connect returns `EINPROGRESS` immediately (no event-loop
+  stall) and completes asynchronously when the verdict arrives — which is
+  *better* than the `EAGAIN`-retry this phase would have introduced.
 
-**Risks / decisions — settle before writing code.**
-- **Blocking vs non-blocking sockets — the load-bearing UX call.** A synchronous
-  block stalls a non-blocking app’s entire event loop, not one connection. Options:
-  block with a short bound then fall back; return `EPERM` immediately on miss and
-  prompt asynchronously (lose “answer in 60s and the original attempt succeeds”);
-  or blend by reading `SS_NBIO` and blocking only truly-blocking sockets. **This
-  decision gates the whole phase.**
-- Sleeping in a MAC hook: confirm the hook’s context may sleep, handle signals
-  and timeouts, and never wedge a thread if the daemon dies mid-wait.
+So the blocking upcall is both impossible here and redundant. It is dropped.
+
+**Consequence for Phase 4.** Retiring divert depended on the hook handling
+misses. It cannot, so **divert stays** as the miss/hold mechanism (and it is
+still required for unconnected UDP and DNS learning regardless). Phase 4 as
+written does not happen.
+
+**If in-kernel per-packet filtering is still wanted**, it needs a different
+mechanism than MAC socket checks — a `pfil(9)` hook with its own in-kernel flow
+verdict table (the old "Option B"), or the userspace pf state-bypass ("Option
+A"). Both are separate designs, out of scope for this module.
 
 **Done when.** A prompt holds a real `connect()` to completion; a non-blocking
 socket behaves per the chosen policy; killing the daemon mid-prompt falls back to
@@ -130,6 +148,12 @@ the failmode rather than hanging.
 
 **Goal.** Remove the TCP divert rules now that Phases 2–3 carry those decisions,
 and decide the fate of the two things divert still does.
+
+> **Blocked.** This phase assumed Phase 3 let the hook handle misses, so the TCP
+> divert rule could go. Phase 3 is not feasible (above), so divert remains the
+> miss/hold mechanism and this phase does not happen. The notes below stand only
+> as a record of what removing divert *would* have required — chiefly that
+> unconnected UDP and DNS learning keep divert regardless.
 
 **Kernel / daemon work.**
 - Drop the TCP `divert-to` rule from the anchor. The anchor shrinks toward
@@ -153,35 +177,35 @@ lane removed must have a proven replacement first.
 
 ---
 
-## Phase 5 — Failmode, sync, productionization
+## Phase 5 — Hardening the Phase 2 cache (still worthwhile)
 
-**Goal.** Make the in-kernel path safe to run unattended and maintainable across
-releases.
+**Goal.** Make the shipped Phases 1–2 robust to run unattended and maintainable
+across releases. This stands on its own now that 3–4 are off the table.
 
 **Kernel / daemon work.**
-- **In-kernel failmode.** With decisions in the hook, a dead daemon means misses
-  with no listener — the hook needs a built-in open/closed default mirroring
-  `failopen.conf`. Today a dead daemon is handled by the watchdog flushing the
-  anchor; that safety net shrinks as divert does, so the failmode moves into the
-  module.
-- Robust cache invalidation and generation handling; boot load-ordering
-  (`kld_list` before things worth attributing); version/KBI pinning so a module
-  built for one FreeBSD release refuses to load into another rather than
-  misbehaving.
-- A panic-safety review of every hook path added in 2–4.
+- **Stale-cache safety when the daemon dies.** The Phase 2 cache can hold a
+  cached deny; if the daemon exits, that deny keeps failing connects with EPERM
+  with nobody able to revise it. Decide the intended behaviour — e.g. the daemon
+  flushes on clean exit, and/or the module ages entries — so a gone daemon does
+  not leave stale enforcement. (The divert-path failmode is still the watchdog's
+  job; this is specifically about the verdict cache.)
+- Boot load-ordering (`kld_list` before things worth attributing); version/KBI
+  pinning so a module built for one FreeBSD release refuses to load into another
+  rather than misbehaving.
+- A panic-safety review of the Phase 2 hook paths.
 
-**Risks / decisions.** Matching the existing failopen semantics exactly;
-accepting per-release KBI maintenance as ongoing cost; the sharper blast radius
-of a bug now being a panic, not a daemon restart.
+**Risks / decisions.** Per-release KBI maintenance as an ongoing cost; the
+sharper blast radius of a bug being a panic, not a daemon restart.
 
 ---
 
 ## Cross-cutting
 
-- **Testing is per-phase, not at the end.** Extend `kmod/tests/` (fuzz the new
-  ioctls, stress the cache under churn, add hooks for the blocking path) and run
-  under `GENERIC-DEBUG` before each phase is done. The rig exists precisely so
-  that adding in-kernel decision logic is survivable.
+- **Testing is per-phase, not at the end.** Extend `kmod/tests/` (fuzz new
+  ioctls, stress the cache under churn) and run under `GENERIC-DEBUG` before a
+  phase is done. The rig exists precisely so that adding in-kernel logic is
+  survivable — and it is also what would have caught the Phase 3 sleep-under-
+  rmlock panic on first load, had the source read not caught it first.
 - **Slot budget.** Each `kldload` consumes a MAC label slot for the boot
   (`security.mac.max_slots` = 4, never reclaimed on unload). Dev reload cycles are
   bounded; production loads once at boot. Unchanged by these phases, but every
@@ -192,8 +216,11 @@ of a bug now being a panic, not a daemon restart.
 
 ## Open decisions
 
-1. **Phase 2 cache key granularity** — binary-scoped (recommended) vs coarser.
-2. **Phase 3 blocking policy** — block-with-timeout, fail-fast-and-prompt, or
-   `SS_NBIO`-aware blend. Gates Phase 3.
-3. **Phase 4 unconnected UDP** — keep a slim divert lane (hybrid) vs patch the
-   MAC framework for a destination-bearing send hook.
+1. **Is there a Phase 5 worth doing**, or is Phase 2 the endpoint? The
+   stale-deny-when-daemon-dies question is the main real item.
+2. **If the per-packet overhead still matters**, which non-MAC lever: the pf
+   state-bypass (Option A, userspace, lowest risk) or a `pfil(9)` redesign
+   (Option B, in-kernel per-packet). Both are separate efforts from this module.
+
+*(Resolved/moot: the Phase 3 blocking policy and the Phase 4 unconnected-UDP
+fork both fell away when Phase 3 proved infeasible — see Phase 3 above.)*
