@@ -19,8 +19,8 @@ Every phase must survive the stress/fuzz harness under the debug kernel
 | 1 | Attribution oracle | **Done** — tested under INVARIANTS/WITNESS |
 | 2 | In-kernel verdict cache (cached deny → EPERM at connect) | **Done** — tested under INVARIANTS/WITNESS |
 | 3 | Fail-fast upcall — decide misses in-kernel, no divert | **Done** — kernel + daemon reader, tested end-to-end (TCP+UDP) |
-| 4 | Slim the divert — in-kernel per-packet **UDP** (keep TCP on divert) | Next |
-| 5 | Failmode + hardening | After 4 |
+| 4 | Slim the divert — in-kernel per-packet **UDP** (keep TCP on divert) | **Done** — UDP divert retired via a daemon-controlled sub-anchor; the per-packet win |
+| 5 | Failmode + hardening (watchdog, stale cache, KBI) | Next |
 
 > **The key realisation.** The destination-bearing hook `socket_check_connect`
 > is not only fired on `connect(2)`: `kern_sendit` calls it on every
