@@ -50,6 +50,13 @@ independent of the daemon and pf. It pushes verdicts straight into the module
 and checks that `connect()` honours them: a cached DENY fails with `EPERM`, a
 miss falls through, a cached ALLOW does not block, and FLUSH clears the deny.
 
+**`utest.c`** — functional test of the Phase 3 fail-fast upcall. Plays the daemon
+in a thread: `read()`s events, resolves them by a toy policy, and checks that a
+miss returns `EAGAIN` and the retry gets the cached verdict — for TCP *and* for
+unconnected UDP `sendto`, proving the destination-bearing hook covers UDP.
+`utest stress <secs>` hammers the upcall queue: a resolver thread against many
+churn threads connecting/sending to random ports.
+
 The stress harness also runs verdict-cache writers (`-v`), pushing and flushing
 verdicts as fast as it can while every churn/fork `connect()` reads the cache in
 the hook — the Phase 2 rwlock stress.

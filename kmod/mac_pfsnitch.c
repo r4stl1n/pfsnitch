@@ -46,7 +46,10 @@
 #include <sys/rwlock.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/ucred.h>
+#include <sys/uio.h>
 #include <sys/vnode.h>
 
 #include <net/vnet.h>
@@ -115,6 +118,9 @@ static LIST_HEAD(pfsn_vbucket, pfsn_verdict) pfsn_vtab[PFSN_VHASH];
 static struct rwlock	pfsn_vlock;
 static u_int		pfsn_vcount;
 
+static void pfsn_cache_insert(uint8_t af, uint8_t proto, const uint8_t *faddr,
+    uint16_t fport, uint8_t verdict, const char *path, size_t plen);
+
 static uint32_t
 pfsn_vhash(uint8_t af, uint8_t proto, const uint8_t *faddr, uint16_t fport)
 {
@@ -147,56 +153,60 @@ pfsn_verdict_lookup(uint8_t af, uint8_t proto, const uint8_t *faddr,
 	return (0);
 }
 
+/* Insert one (binary, destination) verdict, deduping. Caller must NOT hold
+ * pfsn_vlock; may hold pfsn_pmtx (lock order is pmtx -> vlock). */
 static void
-pfsn_verdict_push(const struct pfsnitch_verdict *pv)
+pfsn_cache_insert(uint8_t af, uint8_t proto, const uint8_t *faddr,
+    uint16_t fport, uint8_t verdict, const char *path, size_t plen)
 {
 	struct pfsn_verdict *v;
-	size_t plen;
 	uint32_t b;
-	int n = (pv->af == 4) ? 4 : 16;
+	int n = (af == 4) ? 4 : 16;
 
-	plen = strnlen(pv->path, sizeof(pv->path));
-	if (plen == 0 || plen >= sizeof(pv->path))
-		return;			/* need a NUL-terminated, non-empty path */
-	plen += 1;
-	b = pfsn_vhash(pv->af, pv->proto, pv->faddr, pv->fport);
-
+	if (plen == 0 || plen > 1024)
+		return;
+	b = pfsn_vhash(af, proto, faddr, fport);
 	rw_wlock(&pfsn_vlock);
 	LIST_FOREACH(v, &pfsn_vtab[b], link) {
-		if (v->af == pv->af && v->proto == pv->proto &&
-		    v->fport == pv->fport &&
-		    memcmp(v->faddr, pv->faddr, n) == 0 &&
-		    v->pathlen == plen &&
-		    memcmp(v->path, pv->path, plen) == 0) {
-			v->verdict = pv->verdict;	/* update in place */
+		if (v->af == af && v->proto == proto && v->fport == fport &&
+		    memcmp(v->faddr, faddr, n) == 0 &&
+		    v->pathlen == plen && memcmp(v->path, path, plen) == 0) {
+			v->verdict = verdict;		/* update in place */
 			rw_wunlock(&pfsn_vlock);
 			return;
 		}
 	}
 	if (pfsn_vcount >= PFSN_VMAX) {
-		/* Full: leave it a miss. A missed flow still diverts and the
-		 * daemon still enforces - the cache is an optimisation, never
-		 * the sole authority. */
 		rw_wunlock(&pfsn_vlock);
 		return;
 	}
-	/* M_NOWAIT: cannot sleep holding the rwlock. A failed alloc just
-	 * means this flow keeps diverting - safe. */
+	/* M_NOWAIT: cannot sleep holding the rwlock. */
 	v = malloc(sizeof(*v) + plen, M_PFSNITCH, M_NOWAIT | M_ZERO);
 	if (v == NULL) {
 		rw_wunlock(&pfsn_vlock);
 		return;
 	}
-	v->af = pv->af;
-	v->proto = pv->proto;
-	v->verdict = pv->verdict;
-	v->fport = pv->fport;
-	memcpy(v->faddr, pv->faddr, sizeof(v->faddr));
+	v->af = af;
+	v->proto = proto;
+	v->verdict = verdict;
+	v->fport = fport;
+	memcpy(v->faddr, faddr, sizeof(v->faddr));
 	v->pathlen = plen;
-	memcpy(v->path, pv->path, plen);
+	memcpy(v->path, path, plen);
 	LIST_INSERT_HEAD(&pfsn_vtab[b], v, link);
 	pfsn_vcount++;
 	rw_wunlock(&pfsn_vlock);
+}
+
+static void
+pfsn_verdict_push(const struct pfsnitch_verdict *pv)
+{
+	size_t plen = strnlen(pv->path, sizeof(pv->path));
+
+	if (plen == 0 || plen >= sizeof(pv->path))
+		return;			/* need a NUL-terminated, non-empty path */
+	pfsn_cache_insert(pv->af, pv->proto, pv->faddr, pv->fport, pv->verdict,
+	    pv->path, plen + 1);
 }
 
 static void
@@ -214,6 +224,201 @@ pfsn_verdict_flush(void)
 	}
 	pfsn_vcount = 0;
 	rw_wunlock(&pfsn_vlock);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Phase 3: the fail-fast upcall.
+ *
+ * A cache miss becomes a request the daemon answers into the cache. The hook
+ * never sleeps (it runs under the MAC framework's NOSLEEP rmlock): it enqueues
+ * the request, wakes the daemon, and returns EAGAIN. The daemon read()s the
+ * request, decides, and RESOLVEs it - inserting the verdict so the app's retry
+ * hits. Requests are addressed by a monotonic id, never a pointer, so a resolve
+ * racing a GC'd request is a harmless no-op.
+ * ---------------------------------------------------------------------------
+ */
+#define	PFSN_REQ_MAX	2048		/* cap; full queue applies failmode */
+#define	PFSN_REQ_GCAGE	150		/* seconds before an unanswered req is swept */
+
+struct pfsn_req {
+	TAILQ_ENTRY(pfsn_req)	link;
+	uint64_t	id;
+	uint8_t		af, proto, nonblock, delivered;
+	uint16_t	fport;
+	uint8_t		faddr[16];
+	int		pid;
+	uint32_t	uid;
+	time_t		born;
+	uint16_t	pathlen;
+	char		path[];
+};
+
+static TAILQ_HEAD(, pfsn_req)	pfsn_reqs = TAILQ_HEAD_INITIALIZER(pfsn_reqs);
+static struct mtx	pfsn_pmtx;
+static uint64_t		pfsn_next_id = 1;
+static u_int		pfsn_nreq;
+static int		pfsn_unloading;
+static int		pfsn_upcall_on;		/* daemon is servicing upcalls */
+static int		pfsn_failmode = PFSNITCH_FAIL_OPEN;
+
+static SYSCTL_NODE(_security_mac, OID_AUTO, pfsnitch,
+    CTLFLAG_RW | CTLFLAG_MPSAFE, 0, "pfsnitch");
+SYSCTL_INT(_security_mac_pfsnitch, OID_AUTO, failmode, CTLFLAG_RW,
+    &pfsn_failmode, 0, "verdict when the daemon does not answer: 0=open 1=closed");
+SYSCTL_UINT(_security_mac_pfsnitch, OID_AUTO, pending, CTLFLAG_RD,
+    &pfsn_nreq, 0, "connect/send requests awaiting a verdict");
+
+static int
+pfsn_failverdict(void)
+{
+	return (pfsn_failmode == PFSNITCH_FAIL_CLOSED ? EPERM : 0);
+}
+
+/* Free requests the daemon never answered. Caller holds pfsn_pmtx. */
+static void
+pfsn_req_gc(void)
+{
+	struct pfsn_req *r, *tmp;
+	time_t now = time_uptime;
+
+	TAILQ_FOREACH_SAFE(r, &pfsn_reqs, link, tmp) {
+		if ((now - r->born) > PFSN_REQ_GCAGE) {
+			TAILQ_REMOVE(&pfsn_reqs, r, link);
+			pfsn_nreq--;
+			free(r, M_PFSNITCH);
+		}
+	}
+}
+
+/*
+ * A verdict-cache miss reached the hook. Enqueue it for the daemon and return
+ * EAGAIN (retry). Never sleeps. Deduplicates: a second miss for a request
+ * already pending just returns EAGAIN without queuing another.
+ */
+static int
+pfsn_upcall(uint8_t af, uint8_t proto, const uint8_t *faddr, uint16_t fport,
+    const struct pfsn_info *info, int nonblock)
+{
+	struct pfsn_req *r;
+	size_t plen;
+	int n = (af == 4) ? 4 : 16;
+
+	plen = strnlen(info->path, 1024);
+	if (plen == 0 || plen >= 1024)
+		return (0);			/* nothing to key on; let it pass */
+	plen += 1;
+
+	mtx_lock(&pfsn_pmtx);
+	if (pfsn_unloading) {
+		mtx_unlock(&pfsn_pmtx);
+		return (pfsn_failverdict());
+	}
+	TAILQ_FOREACH(r, &pfsn_reqs, link) {
+		if (r->af == af && r->proto == proto && r->fport == fport &&
+		    memcmp(r->faddr, faddr, n) == 0 &&
+		    r->pathlen == plen && memcmp(r->path, info->path, plen) == 0) {
+			mtx_unlock(&pfsn_pmtx);
+			return (EAGAIN);	/* already asked; retry later */
+		}
+	}
+	if (pfsn_nreq >= PFSN_REQ_MAX) {
+		mtx_unlock(&pfsn_pmtx);
+		return (pfsn_failverdict());
+	}
+	pfsn_req_gc();
+	/* M_NOWAIT: the hook must not sleep. */
+	r = malloc(sizeof(*r) + plen, M_PFSNITCH, M_NOWAIT | M_ZERO);
+	if (r == NULL) {
+		mtx_unlock(&pfsn_pmtx);
+		return (pfsn_failverdict());
+	}
+	r->id = pfsn_next_id++;
+	r->af = af;
+	r->proto = proto;
+	r->nonblock = nonblock ? 1 : 0;
+	r->fport = fport;
+	memcpy(r->faddr, faddr, sizeof(r->faddr));
+	r->pid = info->pid;
+	r->uid = info->uid;
+	r->born = time_uptime;
+	r->pathlen = plen;
+	memcpy(r->path, info->path, plen);
+	TAILQ_INSERT_TAIL(&pfsn_reqs, r, link);
+	pfsn_nreq++;
+	wakeup(&pfsn_reqs);			/* nudge the daemon's read() */
+	mtx_unlock(&pfsn_pmtx);
+	return (EAGAIN);
+}
+
+/* Daemon answers request `id`: cache the verdict and drop the request. An
+ * unknown id (already GC'd, or a stale answer) is a harmless no-op. */
+static void
+pfsn_resolve(uint64_t id, uint8_t verdict)
+{
+	struct pfsn_req *r;
+
+	mtx_lock(&pfsn_pmtx);
+	TAILQ_FOREACH(r, &pfsn_reqs, link) {
+		if (r->id != id)
+			continue;
+		pfsn_cache_insert(r->af, r->proto, r->faddr, r->fport, verdict,
+		    r->path, r->pathlen);
+		TAILQ_REMOVE(&pfsn_reqs, r, link);
+		pfsn_nreq--;
+		free(r, M_PFSNITCH);
+		break;
+	}
+	mtx_unlock(&pfsn_pmtx);
+}
+
+/* Deliver the next undelivered request to the daemon. Blocks (legally - this is
+ * the daemon's read() thread, not the hook) until one exists or unload/EINTR. */
+static int
+pfsn_read(struct cdev *dev, struct uio *uio, int flags)
+{
+	struct pfsn_req *r;
+	struct pfsnitch_event ev;
+	int error;
+
+	if (uio->uio_resid < (ssize_t)sizeof(ev))
+		return (EINVAL);
+
+	mtx_lock(&pfsn_pmtx);
+	for (;;) {
+		/* EOF when unloading, or when the daemon has turned upcalls off
+		 * (its own signal to stop reading) - so a blocked read() returns
+		 * instead of wedging the daemon's shutdown. */
+		if (pfsn_unloading || !pfsn_upcall_on) {
+			mtx_unlock(&pfsn_pmtx);
+			return (0);
+		}
+		TAILQ_FOREACH(r, &pfsn_reqs, link) {
+			if (!r->delivered)
+				break;
+		}
+		if (r != NULL)
+			break;
+		error = msleep(&pfsn_reqs, &pfsn_pmtx, PCATCH, "pfsnrd", 0);
+		if (error != 0) {
+			mtx_unlock(&pfsn_pmtx);
+			return (error);		/* EINTR */
+		}
+	}
+	r->delivered = 1;
+	memset(&ev, 0, sizeof(ev));
+	ev.id = r->id;
+	ev.af = r->af;
+	ev.proto = r->proto;
+	ev.fport = r->fport;
+	memcpy(ev.faddr, r->faddr, sizeof(ev.faddr));
+	ev.nonblock = r->nonblock;
+	ev.pid = r->pid;
+	ev.uid = r->uid;
+	strlcpy(ev.path, r->path, sizeof(ev.path));
+	mtx_unlock(&pfsn_pmtx);
+
+	return (uiomove(&ev, sizeof(ev), uio));	/* outside the lock: may fault */
 }
 
 /*
@@ -353,6 +558,15 @@ pfsn_socket_check_connect(struct ucred *cred, struct socket *so,
 
 	if (verdict == PFSNITCH_V_DENY)
 		return (EPERM);
+	if (verdict == PFSNITCH_V_ALLOW)
+		return (0);
+
+	/* Miss. If the daemon is servicing upcalls (Phase 3), ask it: enqueue and
+	 * return EAGAIN so the app retries once the answer is cached. Otherwise
+	 * fall through (return 0) and let the divert path decide, as in Phase 2. */
+	if (pfsn_upcall_on)
+		return (pfsn_upcall(af, proto, faddr, fport, info,
+		    (so->so_state & SS_NBIO) != 0));
 	return (0);
 }
 
@@ -467,6 +681,27 @@ pfsn_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
 		pfsn_verdict_flush();
 		return (0);
 	}
+	if (cmd == PFSNITCH_RESOLVE) {
+		struct pfsnitch_resolve *pr = (struct pfsnitch_resolve *)data;
+
+		if (pr->version != PFSNITCH_ATTR_VERSION)
+			return (EINVAL);
+		if (pr->verdict != PFSNITCH_V_ALLOW &&
+		    pr->verdict != PFSNITCH_V_DENY)
+			return (EINVAL);
+		pfsn_resolve(pr->id, pr->verdict);
+		return (0);
+	}
+	if (cmd == PFSNITCH_UPCALL_SET) {
+		int on = *(int *)data;
+
+		mtx_lock(&pfsn_pmtx);
+		pfsn_upcall_on = on ? 1 : 0;
+		if (!pfsn_upcall_on)
+			wakeup(&pfsn_reqs);	/* release a blocked reader */
+		mtx_unlock(&pfsn_pmtx);
+		return (0);
+	}
 	if (cmd != PFSNITCH_ATTR_QUERY)
 		return (ENOTTY);
 	q = (struct pfsnitch_attr *)data;
@@ -487,6 +722,7 @@ static struct cdevsw pfsn_cdevsw = {
 	.d_version =	D_VERSION,
 	.d_name =	"pfsnitch",
 	.d_ioctl =	pfsn_ioctl,
+	.d_read =	pfsn_read,
 };
 
 /*
@@ -501,6 +737,7 @@ pfsn_init(struct mac_policy_conf *conf)
 	int i;
 
 	mtx_init(&pfsn_mtx, "pfsnitch", NULL, MTX_DEF);
+	mtx_init(&pfsn_pmtx, "pfsnitch pend", NULL, MTX_DEF);
 	rw_init(&pfsn_vlock, "pfsnitch vcache");
 	for (i = 0; i < PFSN_VHASH; i++)
 		LIST_INIT(&pfsn_vtab[i]);
@@ -512,9 +749,26 @@ static void
 pfsn_destroy(struct mac_policy_conf *conf)
 {
 	struct pfsn_info *info;
+	struct pfsn_req *r;
+
+	/* Release the daemon's blocked read() BEFORE destroy_dev, or destroy_dev
+	 * waits forever on it. Fail-fast has no sleeping hook waiters to drain -
+	 * the only sleeper is the reader - so this is all it takes. New hook
+	 * upcalls cannot arrive: the policy is already unregistered by the time
+	 * mpo_destroy runs. */
+	mtx_lock(&pfsn_pmtx);
+	pfsn_unloading = 1;
+	wakeup(&pfsn_reqs);
+	while ((r = TAILQ_FIRST(&pfsn_reqs)) != NULL) {
+		TAILQ_REMOVE(&pfsn_reqs, r, link);
+		free(r, M_PFSNITCH);
+	}
+	pfsn_nreq = 0;
+	mtx_unlock(&pfsn_pmtx);
 
 	if (pfsn_dev != NULL)
 		destroy_dev(pfsn_dev);
+	mtx_destroy(&pfsn_pmtx);
 
 	/* Sockets that outlive the module keep a stale slot value nobody
 	 * will ever read (only this module reads the slot); their info is

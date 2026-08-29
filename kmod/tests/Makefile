@@ -5,7 +5,7 @@
 #   make run        # build the module's tests and run them (needs root)
 #   make clean
 
-PROGS=	fuzz_ioctl stress
+PROGS=	fuzz_ioctl stress vtest utest
 CFLAGS+=	-O2 -pthread -Wall
 
 all: ${PROGS}
@@ -15,6 +15,12 @@ fuzz_ioctl: fuzz_ioctl.c ../pfsnitch_ioctl.h
 
 stress: stress.c ../pfsnitch_ioctl.h
 	${CC} ${CFLAGS} -o $@ stress.c
+
+vtest: vtest.c ../pfsnitch_ioctl.h
+	${CC} ${CFLAGS} -o $@ vtest.c
+
+utest: utest.c ../pfsnitch_ioctl.h
+	${CC} ${CFLAGS} -o $@ utest.c
 
 run: all
 	sh ./run.sh

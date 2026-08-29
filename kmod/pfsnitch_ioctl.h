@@ -58,6 +58,11 @@ struct pfsnitch_attr {
 #define PFSNITCH_V_ALLOW	1
 #define PFSNITCH_V_DENY		2
 
+/* security.mac.pfsnitch.failmode: what a miss resolves to when the daemon is
+ * absent or the request queue is full. */
+#define PFSNITCH_FAIL_OPEN	0	/* allow */
+#define PFSNITCH_FAIL_CLOSED	1	/* deny */
+
 struct pfsnitch_verdict {
 	uint32_t	version;	/* PFSNITCH_ATTR_VERSION */
 	uint8_t		af;		/* 4 or 6 */
@@ -71,5 +76,47 @@ struct pfsnitch_verdict {
 
 #define PFSNITCH_VERDICT_PUSH	_IOW('F', 2, struct pfsnitch_verdict)
 #define PFSNITCH_VERDICT_FLUSH	_IO('F', 3)
+
+/*
+ * Phase 3: the fail-fast upcall.
+ *
+ * On a cache miss the hook does NOT block (it runs under a non-sleepable rmlock).
+ * It enqueues a request, wakes the daemon, and returns EAGAIN; connect()/sendto()
+ * fails, the protocol's own retransmission (TCP SYN / QUIC datagram) carries the
+ * attempt, and the retry resolves against the cache the daemon populates.
+ *
+ * The daemon read()s struct pfsnitch_event from /dev/pfsnitch (a blocking read in
+ * its own thread - sleeping there is fine, it is not the hook) and answers with
+ * PFSNITCH_RESOLVE, which inserts the verdict into the Phase 2 cache. Requests
+ * are addressed by id, never pointer, so a resolve racing a GC'd request is a
+ * harmless no-op. Because sendto() with a destination is routed through
+ * socket_check_connect too, this path covers unconnected UDP, not just connect().
+ */
+struct pfsnitch_event {
+	uint64_t	id;		/* opaque request id, echoed in resolve */
+	uint8_t		af;		/* 4 or 6 */
+	uint8_t		proto;		/* IPPROTO_TCP / _UDP */
+	uint16_t	fport;		/* destination port, network byte order */
+	uint8_t		faddr[16];
+	uint8_t		nonblock;	/* 1 if the socket was non-blocking */
+	uint8_t		_pad[3];
+	int32_t		pid;		/* connecting process (from the socket label) */
+	uint32_t	uid;
+	char		path[1024];	/* owning binary */
+};
+
+struct pfsnitch_resolve {
+	uint32_t	version;	/* PFSNITCH_ATTR_VERSION */
+	uint8_t		verdict;	/* PFSNITCH_V_ALLOW / PFSNITCH_V_DENY */
+	uint8_t		_pad[3];
+	uint64_t	id;		/* the event's id */
+};
+
+#define PFSNITCH_RESOLVE	_IOW('F', 4, struct pfsnitch_resolve)
+
+/* The daemon turns hook upcalls on (arg 1) once its reader thread is running,
+ * and off (arg 0) on shutdown. While off, a hook miss falls through to the
+ * divert path (Phase 2 behaviour) instead of asking the daemon. */
+#define PFSNITCH_UPCALL_SET	_IOW('F', 5, int)
 
 #endif /* _PFSNITCH_IOCTL_H_ */
