@@ -15,6 +15,7 @@
  */
 
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -197,6 +198,72 @@ stress_mode(int secs)
 	return (0);
 }
 
+/* One socket op to 127.0.0.9:port, no retry; returns errno (0 on success). */
+static int
+one(int udp, int port)
+{
+	struct sockaddr_in d;
+	memset(&d, 0, sizeof(d));
+	d.sin_family = AF_INET;
+	d.sin_port = htons(port);
+	inet_pton(AF_INET, "127.0.0.9", &d.sin_addr);
+	int s = socket(AF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+	int r = udp ? sendto(s, "x", 1, 0, (struct sockaddr *)&d, sizeof(d))
+		    : connect(s, (struct sockaddr *)&d, sizeof(d));
+	int e = (r < 0) ? errno : 0;
+	close(s);
+	return (e);
+}
+
+/* Prove `pfsnitch kernel-reset` clears the upcall and flushes the cache: with
+ * upcall on and a deny cached, a reset must make the deny stop enforcing and a
+ * UDP miss stop upcalling. Pass the pfsnitch binary path as argv[2]. */
+static int
+reset_mode(const char *pfsnitch)
+{
+	struct pfsnitch_verdict v;
+	int on = 1;
+
+	ioctl(dev, PFSNITCH_VERDICT_FLUSH);
+	ioctl(dev, PFSNITCH_UPCALL_SET, &on);
+
+	char selfpath[1024];
+	size_t l = sizeof(selfpath);
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+	sysctl(mib, 4, selfpath, &l, NULL, 0);
+	memset(&v, 0, sizeof(v));
+	v.version = PFSNITCH_ATTR_VERSION;
+	v.af = 4; v.proto = IPPROTO_TCP; v.fport = htons(9);
+	inet_pton(AF_INET, "127.0.0.9", v.faddr);
+	v.verdict = PFSNITCH_V_DENY;
+	strlcpy(v.path, selfpath, sizeof(v.path));
+	ioctl(dev, PFSNITCH_VERDICT_PUSH, &v);
+
+	expect("before: cached TCP deny enforces", one(0, 9), EPERM);
+	/* UDP miss upcalls (no reader here) -> EAGAIN. */
+	expect("before: UDP miss upcalls (EAGAIN)", one(1, 4321), EAGAIN);
+
+	char cmd[1200];
+	snprintf(cmd, sizeof(cmd), "%s kernel-reset", pfsnitch);
+	if (system(cmd) != 0)
+		printf("  (warning: kernel-reset returned nonzero)\n");
+
+	/* 127.0.0.9 isn't a bound local address, so the fell-through op fails at
+	 * the network layer - the point is only that it is NOT EPERM/EAGAIN, i.e.
+	 * the cached deny is gone and the upcall is off. */
+	int te = one(0, 9);
+	printf("  after reset: TCP deny flushed (not EPERM)         got=%s %s\n",
+	    te ? strerror(te) : "ok", te != EPERM ? "PASS" : "FAIL");
+	if (te == EPERM) fails++;
+	int e = one(1, 4321);
+	printf("  after reset: UDP miss falls through (not EAGAIN)  got=%s %s\n",
+	    e ? strerror(e) : "ok", e != EAGAIN ? "PASS" : "FAIL");
+	if (e == EAGAIN) fails++;
+
+	printf("reset: %s\n", fails == 0 ? "ALL PASSED" : "FAILURES");
+	return (fails == 0 ? 0 : 1);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -209,6 +276,8 @@ main(int argc, char **argv)
 		err(1, "/dev/pfsnitch (is mac_pfsnitch loaded?)");
 	if (argc >= 2 && strcmp(argv[1], "stress") == 0)
 		return (stress_mode(argc >= 3 ? atoi(argv[2]) : 15));
+	if (argc >= 2 && strcmp(argv[1], "reset") == 0)
+		return (reset_mode(argc >= 3 ? argv[2] : "pfsnitch"));
 
 	if (ioctl(dev, PFSNITCH_VERDICT_FLUSH) < 0)
 		err(1, "FLUSH");

@@ -174,6 +174,12 @@ pfsnitch_poststart() {
     # without the upcall would let UDP bypass, so it is loaded, not skipped.
     pfctl -a pfsnitch/udpdivert -f "${pfsnitch_udpdivert}" 2>/dev/null ||
         warn "udpdivert sub-anchor failed to load from ${pfsnitch_udpdivert}"
+    # Keep the kernel module's fail default (used when its upcall queue fills or
+    # no daemon answers) in step with this service's. No-op if not loaded.
+    case "${pfsnitch_failmode}" in
+    closed) sysctl security.mac.pfsnitch.failmode=1 >/dev/null 2>&1 ;;
+    *)      sysctl security.mac.pfsnitch.failmode=0 >/dev/null 2>&1 ;;
+    esac
     # `&` alone leaves stdout attached to the rc script, and `service` then
     # blocks waiting for EOF. daemon(8) detaches it properly.
     if [ "${pfsnitch_watchdog}" = "YES" ]; then
@@ -270,6 +276,9 @@ pfsnitch_load_anchor() {
 
 pfsnitch_poststop() {
     pfctl -a pfsnitch -F rules >/dev/null 2>&1
+    # Stop the kernel module upcalling and drop its cache now that no daemon
+    # serves them; a no-op if the module is not loaded.
+    pfsnitch kernel-reset >/dev/null 2>&1 || true
     rm -f /var/run/pfsnitch/answer /var/run/pfsnitch/nonce 2>/dev/null
 }
 

@@ -25,6 +25,7 @@ FAILOPEN="${PFSNITCH_FAILOPEN:-/usr/local/etc/pfsnitch/failopen.conf}"
 INTERVAL=2
 MISSES=0
 THRESHOLD=3        # ~6s of absence before acting
+KRESET=0           # have we reset the kernel module since the daemon vanished?
 
 ANCHOR="${PFSNITCH_ANCHOR:-/usr/local/etc/pfsnitch/anchor.conf}"
 STRANDED=0
@@ -33,6 +34,7 @@ STRANDED_THRESHOLD=3   # ~6s, so a normal start is never raced
 while :; do
     if pgrep -x pfsnitch >/dev/null 2>&1; then
         MISSES=0
+        KRESET=0
 
         # The daemon is alive but the anchor is not diverting to it. That is a
         # half state, and which half depends on how it happened: an anchor left
@@ -61,6 +63,14 @@ while :; do
         STRANDED=0
         MISSES=$((MISSES + 1))
         if [ "$MISSES" -ge "$THRESHOLD" ]; then
+            # Bring the kernel module back to a daemonless-safe state, once: stop
+            # it upcalling into a void and drop any cached verdicts, so it does
+            # not keep enforcing a stale deny or leave UDP on its own failmode
+            # while the anchor failsafe below governs the rest.
+            if [ "$KRESET" = 0 ]; then
+                pfsnitch kernel-reset >/dev/null 2>&1 || true
+                KRESET=1
+            fi
             case "$FAILMODE" in
             closed)
                 if pfctl -a pfsnitch -s rules 2>/dev/null | grep -q .; then

@@ -47,6 +47,7 @@ fn main() {
         "status" => cmd_status(&args),
         "mode" => cmd_mode(&args),
         "attribution" => cmd_attribution(&args),
+        "kernel-reset" => cmd_kernel_reset(),
         "apps" => cmd_apps(&args),
         "forget" => cmd_forget(&args),
         "clear" => cmd_clear(&args),
@@ -952,6 +953,23 @@ fn spawn_prompt(
         };
         let _ = tx.send((ans, Pending { exe, dst, dport, host: if host2.is_empty() { None } else { Some(host2) } }));
     });
+}
+
+/// Put the kernel module back to a daemonless-safe state: stop it upcalling
+/// (there is no reader to answer), and flush the verdict cache (no stale cached
+/// deny should keep enforcing with nobody able to revise it). Run by the
+/// watchdog when the daemon dies and by rc.d on stop, so the module falls in
+/// line with the pf failsafe. A no-op if the module is not loaded.
+fn cmd_kernel_reset() {
+    match kernattr::KernAttr::open() {
+        Ok(k) => {
+            k.set_upcall(false);
+            k.flush_verdicts();
+            eprintln!("pfsnitch: kernel upcall cleared and verdict cache flushed");
+        }
+        // No device means no module loaded - nothing to reset.
+        Err(_) => {}
+    }
 }
 
 fn cmd_attribution(args: &[String]) {
