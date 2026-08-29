@@ -432,8 +432,8 @@ fn run(fallback_mode: policy::Mode) {
     // and the watchdog also cover this; this closes the gap for a plain
     // `kill -TERM` with neither around.)
     unsafe {
-        libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_term as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
 
     // Answers arrive from prompt threads; the read loop must never block on one.

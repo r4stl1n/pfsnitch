@@ -212,19 +212,31 @@ dropped datagram is not retransmitted); see [docs/SAFETY.md](docs/SAFETY.md).
 
 ## Install
 
-FreeBSD, `pf` enabled. `libc` is the only build dependency — deliberately, for a
+FreeBSD, with `pf`. `libc` is the only build dependency — deliberately, for a
 firewall.
 
 ```sh
-cargo build --release
 doas ./install.sh
 ```
 
-The installer stops short of touching `/etc/pf.conf` or starting anything: this
-tool sits in the packet path, and that last step should be a decision you make
-while looking at the machine. It prints the three remaining commands.
+One command: it builds the daemon (and the optional kernel module, if
+`/usr/src` is present), installs everything, wires it to start at boot, and —
+after asking — arms it. The one part that touches live traffic (editing
+`/etc/pf.conf`, turning `pf` on, starting the firewall) is done **last**, and in
+the only ordering that cannot strand the machine: the daemon starts first in
+**visibility** mode (every packet reinjected, nothing blocked), and only then is
+`pf` pointed at it. Inbound SSH and DHCP stay open throughout, and a crash fails
+open via the watchdog, so a remote box is never locked out.
 
-Start in `visibility` and watch what it learns before you enforce anything.
+```sh
+doas ./install.sh --yes      # arm without the confirmation prompt
+doas ./install.sh --no-arm   # build + install only; arm it yourself later
+```
+
+It never overwrites your `policy.conf`, and it won't rewrite a `pf.conf` you've
+already customised — it prints the two lines to add instead. Start in
+`visibility`, review what it learns with `pfsnitch apps`, then
+`pfsnitch mode enforcement` when the rules look right.
 
 If it ever locks you out, `pfsnitch-panic` is in `PATH`, takes no arguments, and
 disables pf outright.
