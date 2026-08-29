@@ -45,6 +45,17 @@ fi
 
 install -d -m 755 /var/run/pfsnitch
 
+# The kernel attribution module is optional and only installed if it was
+# built (cd kmod && make). Installing is not loading: like everything else
+# here, arming it is a decision, not a side effect.
+if [ -f kmod/mac_pfsnitch.ko ]; then
+    install -d -m 755 /boot/modules
+    install -m 555 kmod/mac_pfsnitch.ko /boot/modules/mac_pfsnitch.ko
+    echo "  installed /boot/modules/mac_pfsnitch.ko (optional; see docs/KERNEL.md)"
+    echo "    enable with: kldload mac_pfsnitch && pfsnitch attribution kernel"
+    echo "    at boot:     sysrc kld_list+=mac_pfsnitch"
+fi
+
 cat <<'NEXT'
 
 Installed. Three things left, in this order:

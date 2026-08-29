@@ -86,6 +86,28 @@ with the prompt saying so in red.
 FreeBSD binaries are generally unsigned, so a content hash stands in for the code
 signature Little Snitch uses.
 
+## Two ways to name the process, one of them in the kernel
+
+Attribution — which binary owns this connection — has two backends, switchable
+at runtime like `mode`:
+
+```sh
+pfsnitch attribution procstat    # scan the process table (default, no moving parts)
+pfsnitch attribution kernel      # ask the optional mac_pfsnitch.ko module
+```
+
+The default reconstructs identity backwards from the packet, by scanning every
+process's file table — which costs milliseconds and races a process that
+connects and exits. The kernel module records identity **forwards**, at
+`socket(2)` time in the creating process's own context: exact, race-free, one
+ioctl to ask, and it still names a process that quit right after connecting.
+Sockets the module never saw (started before it loaded) silently fall back to
+the scan, and the log says which backend answered each flow.
+
+Verdicts, policy and packet handling stay in the daemon either way — the module
+attributes, it never decides. Build it from `kmod/`; details and caveats in
+[docs/KERNEL.md](docs/KERNEL.md).
+
 ## Blocked means refused, not hung
 
 A settled deny synthesises a TCP reset, so the application gets

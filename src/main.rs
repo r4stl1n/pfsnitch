@@ -13,6 +13,7 @@
 mod dns;
 mod divert;
 mod identity;
+mod kernattr;
 mod policy;
 mod procinfo;
 mod seen;
@@ -41,6 +42,7 @@ fn main() {
         "rm" | "remove" => cmd_rm(&args),
         "status" => cmd_status(&args),
         "mode" => cmd_mode(&args),
+        "attribution" => cmd_attribution(&args),
         "apps" => cmd_apps(&args),
         "forget" => cmd_forget(&args),
         "clear" => cmd_clear(&args),
@@ -70,6 +72,12 @@ rules (any frontend can drive these - see --json):
   pfsnitch mode [visibility|enforcement]
                               show or switch mode; takes effect within a second,
                               with no restart and no gap in coverage
+  pfsnitch attribution [kernel|procstat]
+                              show or switch how flows are matched to processes:
+                              procstat scans the process table from userspace;
+                              kernel asks mac_pfsnitch.ko, which recorded the
+                              owner at socket creation (exact, race-free, and
+                              falls back to procstat for unlabeled sockets)
   pfsnitch allow host <name>  approve a hostname, and every address it resolves to
   pfsnitch allow app <path>   approve a binary for all destinations
   pfsnitch allow dest <ip>    approve one address (v4 or v6)
@@ -310,10 +318,35 @@ struct Pending {
     dport: u16,
 }
 
+/// Open the kernel attribution device if the policy asks for it, saying what
+/// happened either way: a policy naming a module that is not loaded must be
+/// noticed, not silently downgraded to the userspace path.
+fn kern_backend(pol: &policy::Policy) -> Option<kernattr::KernAttr> {
+    if pol.attribution() != policy::AttributionMode::Kernel {
+        return None;
+    }
+    match kernattr::KernAttr::open() {
+        Ok(k) => {
+            eprintln!("pfsnitch: attribution: kernel (mac_pfsnitch.ko), procstat as fallback");
+            // Start from a known-empty cache: the daemon's policy is the
+            // authority, and any entries a previous daemon left behind must not
+            // outlive it.
+            k.flush_verdicts();
+            Some(k)
+        }
+        Err(e) => {
+            eprintln!("pfsnitch: attribution kernel requested but /dev/pfsnitch: {e}");
+            eprintln!("  using procstat until the module is loaded (kldload mac_pfsnitch)");
+            None
+        }
+    }
+}
+
 fn run(fallback_mode: policy::Mode) {
     let policy_path = Path::new(POLICY_PATH);
     let mut pol = policy::Policy::load(policy_path);
     let mut mode = pol.mode(fallback_mode);
+    let mut kern = kern_backend(&pol);
     let mut pol_mtime = policy::mtime(policy_path);
     let mut last_check = Instant::now();
     // Resolved once: env var, then the policy file's `prompt` directive, then
@@ -405,16 +438,54 @@ fn run(fallback_mode: policy::Mode) {
 
         if last_check.elapsed() >= Duration::from_secs(1) {
             last_check = Instant::now();
+
+            // Keep the kernel backend honest. kldunload revokes the open fd
+            // (every ioctl becomes ENXIO), and a re-loaded module is a NEW
+            // device the old fd will never reach - so a dead handle is dropped
+            // loudly, and while the policy still asks for kernel attribution
+            // the open is retried each tick, silently on failure (once a
+            // second is not worth a log line) and loudly on recovery.
+            if pol.attribution() == policy::AttributionMode::Kernel {
+                if kern.as_ref().is_some_and(|k| k.is_dead()) {
+                    eprintln!("pfsnitch: /dev/pfsnitch went away (module unloaded?); using procstat");
+                    kern = None;
+                } else if kern.is_none() {
+                    if let Ok(k) = kernattr::KernAttr::open() {
+                        eprintln!("pfsnitch: attribution: kernel (mac_pfsnitch.ko reconnected)");
+                        // A reloaded module has an empty cache already; flush is
+                        // belt and braces so the daemon and kernel never disagree.
+                        k.flush_verdicts();
+                        kern = Some(k);
+                    }
+                }
+            }
+
             let m = policy::mtime(policy_path);
             if m != pol_mtime {
                 pol_mtime = m;
+                let was_attr = pol.attribution();
                 pol = policy::Policy::load(policy_path);
                 let was = mode;
                 mode = pol.mode(fallback_mode);
+                if pol.attribution() != was_attr {
+                    // Same runtime-switch contract as mode: takes effect within
+                    // a second, never restarts the daemon or drops the socket.
+                    kern = kern_backend(&pol);
+                    if pol.attribution() == policy::AttributionMode::Procstat {
+                        eprintln!("pfsnitch: attribution: procstat (userspace)");
+                    }
+                }
                 // Every cached verdict was derived from the policy that just
                 // changed. Keeping them would mean a rule you added or removed
                 // silently not applying to traffic already in flight.
                 decided.clear();
+                // The kernel cache is derived from the policy that just changed,
+                // so it must be abandoned at the same instant as the daemon's own
+                // decided map - a cached allow or deny outliving its rule is a
+                // correctness failure. Flows re-populate it as they recur.
+                if let Some(k) = kern.as_ref() {
+                    k.flush_verdicts();
+                }
                 eprintln!("pfsnitch: policy reloaded: {}", pol.summary());
                 if mode != was {
                     // Worth its own line: this is the one setting that changes
@@ -504,7 +575,15 @@ fn run(fallback_mode: policy::Mode) {
                     // reinjected above. The flag stays explicit because the weak
                     // attribution tiers key on the packet's SOURCE as the local
                     // end, which is only true outbound - see procinfo::Tables::get.
-                    let att = res.resolve(&t, true);
+                    //
+                    // The kernel backend is asked first when configured; a miss
+                    // there is normal (a socket from before the module loaded)
+                    // and falls through to the procstat scan, with the
+                    // confidence tier recording which one answered.
+                    let att = kern
+                        .as_ref()
+                        .and_then(|k| k.query(&t))
+                        .or_else(|| res.resolve(&t, true));
                     let owner = att.as_ref().map(|a| a.owner.clone());
                     let exe = owner.as_ref().map(|o| o.path.clone());
                     // "none" is not just a weaker "local": it is what turns an
@@ -601,6 +680,21 @@ fn run(fallback_mode: policy::Mode) {
                             decided.clear();
                         }
                         decided.insert(flow, verdict);
+
+                        // Phase 2: push the settled verdict into the kernel's
+                        // cache, so a later connect() to this (binary,
+                        // destination) is answered in the socket hook - a cached
+                        // deny fails connect() with EPERM, before any packet.
+                        //
+                        // Only while enforcing. Visibility must never block, but
+                        // the kernel hook has no notion of mode and enforces a
+                        // cached deny unconditionally - so nothing is pushed while
+                        // observing, and the mode switch itself flushes the cache.
+                        if mode.enforcing() {
+                            if let (Some(k), Some(p)) = (kern.as_ref(), exe.as_deref()) {
+                                k.push_verdict(f.proto, f.dst, f.dport, p, matches!(verdict, Verdict::Allow));
+                            }
+                        }
                     }
 
                     // DNS-over-HTTPS, which we cannot observe.
@@ -616,12 +710,16 @@ fn run(fallback_mode: policy::Mode) {
                     }
 
                     if logged.insert(flow) {
+                        // The tier says which backend did the naming (kernel /
+                        // exact / local / port), which is how you verify that
+                        // `attribution kernel` is actually answering rather
+                        // than silently falling back to the procstat scan.
                         println!(
                             "{:<6} {}:{} -> {} ({}) :{}  {}",
                             label,
                             f.src, f.sport, f.dst, host, f.dport,
                             owner.as_ref()
-                                .map(|o| format!("{} [{}] {}", o.command, o.pid, o.path))
+                                .map(|o| format!("{} [{}] {} ({scope})", o.command, o.pid, o.path))
                                 .unwrap_or_else(|| "<unattributed>".into()),
                         );
                     }
@@ -701,6 +799,50 @@ fn spawn_prompt(
         };
         let _ = tx.send((ans, Pending { exe, dst, dport, host: if host2.is_empty() { None } else { Some(host2) } }));
     });
+}
+
+fn cmd_attribution(args: &[String]) {
+    let path = Path::new(POLICY_PATH);
+    let pol = policy::Policy::load(path);
+    match args.get(2) {
+        None => println!("{}", pol.attribution().as_str()),
+        Some(want) => {
+            let a = match policy::AttributionMode::parse(want) {
+                Some(a) => a,
+                None => {
+                    eprintln!("pfsnitch: unknown attribution backend {want:?}");
+                    eprintln!("  want: kernel | procstat");
+                    std::process::exit(64);
+                }
+            };
+            if a == policy::AttributionMode::Kernel && !Path::new("/dev/pfsnitch").exists() {
+                // Not fatal - the module may be loaded later, and the daemon
+                // falls back to procstat until it is - but silently accepting
+                // a setting that does nothing yet would read as it working.
+                eprintln!("pfsnitch: note: /dev/pfsnitch not present (kldload mac_pfsnitch)");
+                eprintln!("  the daemon will use procstat until the module is loaded");
+            }
+            match policy::set_attribution(path, a) {
+                Ok(()) => {
+                    println!("attribution: {}", a.as_str());
+                    match a {
+                        policy::AttributionMode::Kernel => {
+                            println!("  flows are named by mac_pfsnitch.ko, recorded at socket");
+                            println!("  creation; procstat remains the fallback for a miss");
+                        }
+                        policy::AttributionMode::Procstat => {
+                            println!("  flows are named by scanning the process table (userspace)");
+                        }
+                    }
+                    println!("  the running daemon picks this up within a second");
+                }
+                Err(e) => {
+                    eprintln!("pfsnitch: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 fn cmd_mode(args: &[String]) {

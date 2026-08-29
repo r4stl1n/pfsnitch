@@ -21,6 +21,16 @@ default ask
 # no restart, and therefore no gap where traffic passes unfiltered.
 mode visibility
 
+# attribution procstat|kernel
+#
+# procstat - name the process behind a flow by scanning the process table
+#            from userspace. The default: no moving parts.
+# kernel   - ask mac_pfsnitch.ko, which recorded the owner at socket creation.
+#            Exact and race-free, but needs the module loaded (kld_list in
+#            rc.conf); anything it cannot answer falls back to procstat.
+#            See docs/KERNEL.md.
+# attribution kernel
+
 # Which program asks the user. Any executable honouring the documented contract
 # works - argv is "EXE PID COMMAND DST DPORT [HOSTNAME]" and it prints one of
 # allow-conn|allow-app|block-conn|block-app|timeout. Overridden by $PFSNITCH_PROMPT.

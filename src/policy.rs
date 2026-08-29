@@ -110,6 +110,9 @@ pub struct Policy {
     /// a switch takes effect without a restart - and therefore without ever
     /// dropping the divert socket and letting traffic past unfiltered.
     mode: Option<Mode>,
+    /// Which attribution backend names the process behind a flow. Lives here
+    /// for the same reason mode does: switchable at runtime, no restart.
+    attribution: Option<AttributionMode>,
 }
 
 impl Policy {
@@ -149,6 +152,10 @@ impl Policy {
                 "mode" => match Mode::parse(v) {
                     Some(m) => p.mode = Some(m),
                     None => eprintln!("policy:{}: bad mode {v:?}", n + 1),
+                },
+                "attribution" => match AttributionMode::parse(v) {
+                    Some(a) => p.attribution = Some(a),
+                    None => eprintln!("policy:{}: bad attribution {v:?} (want kernel | procstat)", n + 1),
                 },
                 "allow-host-from" => match split_scoped(v) {
                     Some((h, e)) => { let (hh, pt) = split_target(&h); p.allow_host_from.insert((e, hh.to_lowercase(), pt)); }
@@ -715,28 +722,66 @@ impl Mode {
     }
 }
 
+/// Which backend names the process behind a flow.
+///
+/// `Procstat` is the userspace path that has always existed: scan the process
+/// table via libprocstat and match sockets to the tuple. `Kernel` asks
+/// mac_pfsnitch.ko, which recorded the owner at socket creation - exact and
+/// race-free, but only for sockets created while the module was loaded, so
+/// the daemon still falls back to procstat on a miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributionMode {
+    Procstat,
+    Kernel,
+}
+
+impl AttributionMode {
+    pub fn parse(s: &str) -> Option<AttributionMode> {
+        match s.trim().to_lowercase().as_str() {
+            "procstat" | "userspace" => Some(AttributionMode::Procstat),
+            "kernel" => Some(AttributionMode::Kernel),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttributionMode::Procstat => "procstat",
+            AttributionMode::Kernel => "kernel",
+        }
+    }
+}
+
 impl Policy {
     /// The mode to run in: the policy file wins, falling back to whatever the
     /// daemon was started with.
     pub fn mode(&self, fallback: Mode) -> Mode {
         self.mode.unwrap_or(fallback)
     }
+
+    /// The attribution backend. Userspace unless the file opts in: the kernel
+    /// path needs a module loaded, and an unstated default must be the one
+    /// with no moving parts.
+    pub fn attribution(&self) -> AttributionMode {
+        self.attribution.unwrap_or(AttributionMode::Procstat)
+    }
 }
 
-/// Write the mode into the policy file, replacing any existing setting.
+/// Write a single-valued directive into the policy file, replacing any
+/// existing setting.
 ///
 /// Rewrites rather than appends so repeated toggling cannot leave a stack of
-/// stale `mode` lines, where the last one silently wins and the file no longer
-/// says what it does.
-pub fn set_mode(path: &Path, mode: Mode) -> io::Result<()> {
+/// stale lines, where the last one silently wins and the file no longer says
+/// what it does.
+fn set_directive(path: &Path, key: &str, value: &str) -> io::Result<()> {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut out = String::new();
     let mut written = false;
     for raw in text.lines() {
-        let is_mode = matches!(parse_line(raw), Some((ref k, _, _)) if k == "mode");
-        if is_mode {
+        let is_key = matches!(parse_line(raw), Some((ref k, _, _)) if k == key);
+        if is_key {
             if !written {
-                out.push_str(&format!("mode {}\n", mode.as_str()));
+                out.push_str(&format!("{key} {value}\n"));
                 written = true;
             }
             continue;
@@ -745,9 +790,17 @@ pub fn set_mode(path: &Path, mode: Mode) -> io::Result<()> {
         out.push('\n');
     }
     if !written {
-        out.push_str(&format!("mode {}\n", mode.as_str()));
+        out.push_str(&format!("{key} {value}\n"));
     }
     write_atomic(path, &out)
+}
+
+pub fn set_mode(path: &Path, mode: Mode) -> io::Result<()> {
+    set_directive(path, "mode", mode.as_str())
+}
+
+pub fn set_attribution(path: &Path, a: AttributionMode) -> io::Result<()> {
+    set_directive(path, "attribution", a.as_str())
 }
 
 /// Where a recorded rule came from.
