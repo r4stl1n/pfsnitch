@@ -1,9 +1,17 @@
 # Kernel module roadmap
 
 The plan for taking `mac_pfsnitch` from an attribution helper to an in-kernel
-filter that decides TCP and UDP per packet without the divert round trip. This
-is the **kernel route only** — the pf state-bypass alternative (“Option A”) is
+filter that decides UDP per packet without the divert round trip. This is the
+**kernel route only** — the pf state-bypass alternative (“Option A”) is
 deliberately out of scope here.
+
+**Status: all five phases done.** The kernel module attributes exactly and
+race-free (1), caches verdicts and denies at connect (2), decides UDP misses via
+a fail-fast upcall (3), and — with its UDP divert rule retired (4) — decides
+every subsequent UDP datagram with a bare in-kernel cache lookup, no userspace
+round trip. A crashed daemon is handled safely (5). TCP stays on the transparent
+divert-hold throughout. What remains is ongoing, not a phase: per-release KBI
+rebuilds, and real-world measurement of the per-datagram hook cost.
 
 The guiding principle is unchanged from Phase 1: **the kernel stays a cache, the
 daemon stays the brain.** Policy — hostnames, wildcards, modes, per-binary rules —
@@ -20,7 +28,7 @@ Every phase must survive the stress/fuzz harness under the debug kernel
 | 2 | In-kernel verdict cache (cached deny → EPERM at connect) | **Done** — tested under INVARIANTS/WITNESS |
 | 3 | Fail-fast upcall — decide misses in-kernel, no divert | **Done** — kernel + daemon reader, tested end-to-end (TCP+UDP) |
 | 4 | Slim the divert — in-kernel per-packet **UDP** (keep TCP on divert) | **Done** — UDP divert retired via a daemon-controlled sub-anchor; the per-packet win |
-| 5 | Failmode + hardening (watchdog, stale cache, KBI) | Next |
+| 5 | Failmode + hardening (watchdog, stale cache) | **Done** — `kernel-reset` on daemon death, failmode synced from rc.conf |
 
 > **The key realisation.** The destination-bearing hook `socket_check_connect`
 > is not only fired on `connect(2)`: `kern_sendit` calls it on every
