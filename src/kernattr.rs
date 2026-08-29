@@ -63,6 +63,46 @@ struct PfsnitchVerdict {
     path: [u8; 1024],
 }
 
+/// kmod/pfsnitch_ioctl.h `struct pfsnitch_event`, bit for bit. Read from the
+/// device: a connect/send miss the kernel wants a verdict for.
+#[repr(C)]
+struct PfsnitchEvent {
+    id: u64,
+    af: u8,
+    proto: u8,
+    fport: u16, // network byte order
+    faddr: [u8; 16],
+    nonblock: u8,
+    _pad: [u8; 3],
+    pid: i32,
+    uid: u32,
+    path: [u8; 1024],
+}
+
+/// kmod/pfsnitch_ioctl.h `struct pfsnitch_resolve`, bit for bit.
+#[repr(C)]
+struct PfsnitchResolve {
+    version: u32,
+    verdict: u8,
+    _pad: [u8; 3],
+    id: u64,
+}
+
+/// A connect/send that missed the cache and needs a verdict. Attribution is
+/// already done — the kernel read the owning binary off the socket's label — so
+/// the daemon only has to apply policy and answer.
+#[derive(Debug, Clone)]
+pub struct KernEvent {
+    pub id: u64,
+    pub proto: u8,
+    pub dst: IpAddr,
+    pub dport: u16,
+    pub nonblock: bool,
+    pub pid: i32,
+    pub uid: u32,
+    pub path: String,
+}
+
 const IOC_VOID: libc::c_ulong = 0x2000_0000;
 const IOC_IN: libc::c_ulong = 0x8000_0000;
 const IOC_INOUT: libc::c_ulong = 0xC000_0000;
@@ -84,6 +124,82 @@ const fn verdict_push_cmd() -> libc::c_ulong {
 /// _IO('F', 3)
 const fn verdict_flush_cmd() -> libc::c_ulong {
     ioc(IOC_VOID, 3, 0)
+}
+/// _IOW('F', 4, struct pfsnitch_resolve)
+const fn resolve_cmd() -> libc::c_ulong {
+    ioc(IOC_IN, 4, std::mem::size_of::<PfsnitchResolve>() as libc::c_ulong)
+}
+/// _IOW('F', 5, int)
+const fn upcall_set_cmd() -> libc::c_ulong {
+    ioc(IOC_IN, 5, std::mem::size_of::<libc::c_int>() as libc::c_ulong)
+}
+
+/// A second, read-only handle on `/dev/pfsnitch` dedicated to blocking on
+/// pending upcall events. Kept separate from `KernAttr` so the reader thread's
+/// blocking `read()` never contends with the main loop's query/push/resolve
+/// ioctls on one fd.
+pub struct KernReader {
+    fd: RawFd,
+}
+
+impl KernReader {
+    pub fn open() -> io::Result<Self> {
+        let fd = unsafe {
+            libc::open(
+                PFSNITCH_DEV.as_ptr() as *const libc::c_char,
+                libc::O_RDWR | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(KernReader { fd })
+    }
+
+    /// Block until the kernel has a miss to decide. `Ok(None)` is EOF — the
+    /// module turned upcalls off or unloaded, and the reader should stop.
+    pub fn read_event(&self) -> io::Result<Option<KernEvent>> {
+        let mut ev: PfsnitchEvent = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::read(
+                self.fd,
+                &mut ev as *mut _ as *mut libc::c_void,
+                std::mem::size_of::<PfsnitchEvent>(),
+            )
+        };
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n as usize != std::mem::size_of::<PfsnitchEvent>() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short event"));
+        }
+        let dst = match ev.af {
+            4 => IpAddr::from(<[u8; 4]>::try_from(&ev.faddr[..4]).unwrap()),
+            6 => IpAddr::from(ev.faddr),
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad af")),
+        };
+        let end = ev.path.iter().position(|&c| c == 0).unwrap_or(ev.path.len());
+        let path = String::from_utf8_lossy(&ev.path[..end]).into_owned();
+        Ok(Some(KernEvent {
+            id: ev.id,
+            proto: ev.proto,
+            dst,
+            dport: u16::from_be(ev.fport),
+            nonblock: ev.nonblock != 0,
+            pid: ev.pid,
+            uid: ev.uid,
+            path,
+        }))
+    }
+}
+
+impl Drop for KernReader {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
 }
 
 pub struct KernAttr {
@@ -218,6 +334,37 @@ impl KernAttr {
         }
     }
 
+    /// Answer a pending upcall event: cache the verdict (kernel-side) so the
+    /// app's retry resolves. An unknown id (GC'd, or already answered) is a
+    /// harmless no-op in the module.
+    pub fn resolve(&self, id: u64, allow: bool) {
+        if self.dead.get() {
+            return;
+        }
+        let r = PfsnitchResolve {
+            version: PFSNITCH_ATTR_VERSION,
+            verdict: if allow { PFSNITCH_V_ALLOW } else { PFSNITCH_V_DENY },
+            _pad: [0; 3],
+            id,
+        };
+        if unsafe { libc::ioctl(self.fd, resolve_cmd(), &r) } < 0 {
+            self.note_errno();
+        }
+    }
+
+    /// Turn hook upcalls on or off. On: a cache miss asks the daemon (this
+    /// path). Off: a miss falls through to the divert path (Phase 2). The daemon
+    /// enables it once its reader thread is up and disables it on shutdown.
+    pub fn set_upcall(&self, on: bool) {
+        if self.dead.get() {
+            return;
+        }
+        let v: libc::c_int = if on { 1 } else { 0 };
+        if unsafe { libc::ioctl(self.fd, upcall_set_cmd(), &v) } < 0 {
+            self.note_errno();
+        }
+    }
+
     /// A destroyed device answers ENOTTY — observed, not assumed: devfs swaps a
     /// dead cdevsw under the open fd and its ioctl entry knows no commands at
     /// all. The same errno would come from a daemon/module ABI mismatch, and
@@ -258,5 +405,13 @@ mod tests {
         assert_eq!(std::mem::size_of::<PfsnitchVerdict>(), 1052);
         assert_eq!(verdict_push_cmd(), 0x841C_4602);
         assert_eq!(verdict_flush_cmd(), 0x2000_4603);
+    }
+
+    #[test]
+    fn upcall_abi_layout_matches_the_c_header() {
+        assert_eq!(std::mem::size_of::<PfsnitchEvent>(), 1064);
+        assert_eq!(std::mem::size_of::<PfsnitchResolve>(), 16);
+        assert_eq!(resolve_cmd(), 0x8010_4604);
+        assert_eq!(upcall_set_cmd(), 0x8004_4605);
     }
 }

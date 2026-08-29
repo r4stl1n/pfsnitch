@@ -374,8 +374,22 @@ fn run(fallback_mode: policy::Mode) {
         eprintln!("  talks to. Prompts appear only in enforcement, where there is a decision to make.");
     }
 
+    // Keep the loop ticking without divert traffic so the upcall channel and
+    // periodic work are serviced promptly.
+    let _ = d.set_read_timeout(100);
+
     // Answers arrive from prompt threads; the read loop must never block on one.
     let (tx, rx) = mpsc::channel::<(Answer, Pending)>();
+
+    // Phase 3 upcall: the reader thread delivers cache-miss events here; the
+    // main loop decides and RESOLVEs them, keeping all policy state single-
+    // threaded. `upcall_on` tracks whether the hook is asking us (enabled only
+    // with the kernel backend, in enforcement - visibility must never block).
+    // `pending_upcalls` holds event ids awaiting a prompt answer, keyed exactly
+    // like `asking`, so one answer resolves every miss it covers.
+    let (utx, urx) = mpsc::channel::<kernattr::KernEvent>();
+    let mut upcall_on = false;
+    let mut pending_upcalls: HashMap<(String, String), Vec<u64>> = HashMap::new();
 
     let mut res = procinfo::Resolver::new();
     let mut ident = identity::Identity::new();
@@ -407,6 +421,17 @@ fn run(fallback_mode: policy::Mode) {
         while let Ok((ans, p)) = rx.try_recv() {
             let key = (p.exe.clone().unwrap_or_default(), ask_key(p.host.as_deref(), p.dst));
             asking.remove(&key);
+            // Any upcall misses that were waiting on this prompt get the answer
+            // now, so their retries resolve. Do this before pol.record so the
+            // kernel cache and the policy file settle together.
+            if let Some(ids) = pending_upcalls.remove(&key) {
+                let allow = matches!(ans, Answer::AllowConn | Answer::AllowApp);
+                if let Some(k) = kern.as_ref() {
+                    for id in ids {
+                        k.resolve(id, allow);
+                    }
+                }
+            }
             if let Some(e) = p.exe.as_deref() {
                 if matches!(ans, Answer::AllowConn | Answer::AllowApp) {
                     // Re-pin: if this approval follows a change warning, the
@@ -420,6 +445,61 @@ fn run(fallback_mode: policy::Mode) {
             }
             pol.record(policy_path, ans, p.exe.as_deref(), p.dst, p.host.as_deref(), p.dport, policy::Origin::Approved);
             eprintln!("  decision: {:?} for {} -> {}", ans, p.exe.as_deref().unwrap_or("?"), p.dst);
+        }
+
+        // Drain kernel upcalls: cache misses the hook is asking us to decide.
+        // Attribution is already done (the event carries the owning binary), so
+        // this is policy only, then RESOLVE - allow/deny answer at once, ask
+        // spawns a prompt and answers when the user does. Enforcement only:
+        // upcalls are never enabled in visibility.
+        while let Ok(ev) = urx.try_recv() {
+            if ev.path.is_empty() {
+                if let Some(k) = kern.as_ref() { k.resolve(ev.id, true); }
+                continue;
+            }
+            let host = names.name_for(&ev.dst).map(|s| s.to_string());
+            let mut id_changed = false;
+            if let Some(expected) = pol.expected_id(&ev.path).map(str::to_string) {
+                if let Some(actual) = ident.hash(&ev.path) {
+                    if actual != expected {
+                        id_changed = true;
+                        if id_warned.insert(ev.path.clone()) {
+                            eprintln!(
+                                "pfsnitch: BINARY CHANGED {}\n  approved {expected}\n  now      {actual}\n  its rules are being ignored until you approve it again",
+                                ev.path
+                            );
+                        }
+                    }
+                }
+            }
+            let verdict = if id_changed {
+                Verdict::Ask
+            } else {
+                pol.decide(Some(&ev.path), ev.dst, host.as_deref(), ev.dport)
+            };
+            match verdict {
+                Verdict::Allow => { if let Some(k) = kern.as_ref() { k.resolve(ev.id, true); } }
+                Verdict::Deny => { if let Some(k) = kern.as_ref() { k.resolve(ev.id, false); } }
+                Verdict::Ask => {
+                    let hostname = host.clone().unwrap_or_default();
+                    let key = (
+                        ev.path.clone(),
+                        ask_key(if hostname.is_empty() { None } else { Some(&hostname) }, ev.dst),
+                    );
+                    if asking.insert(key.clone()) {
+                        let cmd = ev.path.rsplit('/').next().unwrap_or(&ev.path).to_string();
+                        spawn_prompt(
+                            prompt_bin.clone(), id_changed, tx.clone(),
+                            Some(ev.path.clone()), ev.pid, cmd,
+                            ev.dst, ev.dport, hostname, "kernel".to_string(),
+                        );
+                    }
+                    // Answered when the prompt returns; see the rx drain above.
+                    pending_upcalls.entry(key).or_default().push(ev.id);
+                }
+            }
+            let dest = host.as_deref().unwrap_or("-");
+            eprintln!("  upcall {verdict:?}  {} -> {} ({dest}) :{}", ev.path, ev.dst, ev.dport);
         }
 
         // Pick up edits from any source - our own CLI, an editor, a frontend.
@@ -493,10 +573,41 @@ fn run(fallback_mode: policy::Mode) {
                     eprintln!("pfsnitch: mode {} -> {}", was.as_str(), mode.as_str());
                 }
             }
+
+            // Reconcile the upcall: on only with the kernel backend, in
+            // enforcement - visibility must never drop a first packet. The
+            // reader thread is (re)spawned on enable and exits on the EOF that
+            // disabling (or unload) produces.
+            let want_upcall = kern.is_some() && mode.enforcing();
+            if want_upcall && !upcall_on {
+                match kernattr::KernReader::open() {
+                    Ok(rd) => {
+                        if let Some(k) = kern.as_ref() { k.set_upcall(true); }
+                        let utx2 = utx.clone();
+                        std::thread::spawn(move || {
+                            while let Ok(Some(ev)) = rd.read_event() {
+                                if utx2.send(ev).is_err() { break; }
+                            }
+                        });
+                        upcall_on = true;
+                        eprintln!("pfsnitch: upcall enabled - misses decided in-kernel");
+                    }
+                    Err(e) => eprintln!("pfsnitch: upcall reader open failed: {e}"),
+                }
+            } else if !want_upcall && upcall_on {
+                if let Some(k) = kern.as_ref() { k.set_upcall(false); }
+                upcall_on = false;
+                // Any waiters will never be answered now; drop them - their apps
+                // fall back to the divert path on retry.
+                pending_upcalls.clear();
+                eprintln!("pfsnitch: upcall disabled");
+            }
         }
 
         let (n, from) = match d.recv(&mut buf) {
             Ok(v) => v,
+            // Timed out with no packet: loop back to service the channels.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => { eprintln!("recv: {e}"); continue; }
         };
 
