@@ -418,7 +418,46 @@ pfsn_read(struct cdev *dev, struct uio *uio, int flags)
 	strlcpy(ev.path, r->path, sizeof(ev.path));
 	mtx_unlock(&pfsn_pmtx);
 
-	return (uiomove(&ev, sizeof(ev), uio));	/* outside the lock: may fault */
+	error = uiomove(&ev, sizeof(ev), uio);	/* outside the lock: may fault */
+	if (error != 0) {
+		/* The event never reached the daemon. Re-mark the request
+		 * undelivered so it is handed out again rather than stalling until
+		 * GC. It may have been resolved and freed meanwhile, so find it by
+		 * id rather than reusing the pointer. */
+		mtx_lock(&pfsn_pmtx);
+		TAILQ_FOREACH(r, &pfsn_reqs, link) {
+			if (r->id == ev.id) {
+				r->delivered = 0;
+				wakeup(&pfsn_reqs);
+				break;
+			}
+		}
+		mtx_unlock(&pfsn_pmtx);
+	}
+	return (error);
+}
+
+/*
+ * Last close of /dev/pfsnitch: the daemon - our only reader - is gone, whether
+ * it exited cleanly or crashed. Stop upcalling into a void so UDP misses fall
+ * through (to the divert path) instead of stalling on EAGAIN until the watchdog
+ * notices. This heals the upcall half of a daemon death instantly; the pf
+ * udpdivert reload and the verdict cache are left to the watchdog's kernel-reset,
+ * which knows the configured failmode. d_close fires only on the LAST close
+ * (no D_TRACKCLOSE), so a short-lived tool opening the device does not trip it
+ * while the daemon still holds it open.
+ */
+static int
+pfsn_dev_close(struct cdev *dev, int fflag, int devtype, struct thread *td)
+{
+	mtx_lock(&pfsn_pmtx);
+	if (pfsn_upcall_on) {
+		pfsn_upcall_on = 0;
+		wakeup(&pfsn_reqs);
+		printf("mac_pfsnitch: device last-closed - upcall auto-disabled\n");
+	}
+	mtx_unlock(&pfsn_pmtx);
+	return (0);
 }
 
 /*
@@ -731,6 +770,7 @@ static struct cdevsw pfsn_cdevsw = {
 	.d_name =	"pfsnitch",
 	.d_ioctl =	pfsn_ioctl,
 	.d_read =	pfsn_read,
+	.d_close =	pfsn_dev_close,
 };
 
 /*

@@ -23,8 +23,21 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// Set by the SIGTERM/SIGINT handler so the run loop can undo the kernel and pf
+/// state it established (upcall on, UDP divert flushed, verdict cache) before
+/// exiting. A panic aborts (`panic = "abort"`) and cannot run this — that path
+/// is covered by the watchdog and by the kernel auto-disabling the upcall on the
+/// last close of /dev/pfsnitch.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_sig: libc::c_int) {
+    // Async-signal-safe: only a relaxed atomic store.
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 
 const DIVERT_PORT: u16 = 8668;
 const POLICY_PATH: &str = "/usr/local/etc/pfsnitch/policy.conf";
@@ -415,6 +428,14 @@ fn run(fallback_mode: policy::Mode) {
     // periodic work are serviced promptly.
     let _ = d.set_read_timeout(100);
 
+    // Clean up the kernel/pf state on a graceful signal. (The rc.d stop path
+    // and the watchdog also cover this; this closes the gap for a plain
+    // `kill -TERM` with neither around.)
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as libc::sighandler_t);
+    }
+
     // Answers arrive from prompt threads; the read loop must never block on one.
     let (tx, rx) = mpsc::channel::<(Answer, Pending)>();
 
@@ -454,6 +475,21 @@ fn run(fallback_mode: policy::Mode) {
     let mut buf = vec![0u8; 65_535];
 
     loop {
+        // Graceful shutdown: undo what we established so a kill leaves no stale
+        // kernel/pf state behind. A signal also interrupts the recv() below, so
+        // this is reached within a tick.
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("pfsnitch: signalled - clearing kernel upcall/cache, restoring UDP divert");
+            if let Some(k) = kern.as_ref() {
+                k.set_upcall(false);
+                k.flush_verdicts();
+            }
+            if upcall_on {
+                set_udp_divert(true);
+            }
+            std::process::exit(0);
+        }
+
         // Drain any answers first so policy is current before the next verdict.
         while let Ok((ans, p)) = rx.try_recv() {
             let key = (p.exe.clone().unwrap_or_default(), ask_key(p.host.as_deref(), p.dst));
@@ -649,8 +685,10 @@ fn run(fallback_mode: policy::Mode) {
 
         let (n, from) = match d.recv(&mut buf) {
             Ok(v) => v,
-            // Timed out with no packet: loop back to service the channels.
+            // Timed out, or a signal interrupted it: loop back to service the
+            // channels and re-check the shutdown flag.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => { eprintln!("recv: {e}"); continue; }
         };
 
