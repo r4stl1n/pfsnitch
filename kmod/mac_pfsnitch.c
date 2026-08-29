@@ -566,8 +566,13 @@ pfsn_socket_check_connect(struct ucred *cred, struct socket *so,
 	 * here so the UDP divert rule can be retired and every later datagram is a
 	 * bare cache lookup. TCP misses fall through (return 0) to the divert-hold,
 	 * which carries a held connect() transparently via SYN retransmission;
-	 * fail-fast has no SYN to retransmit for TCP, so leave TCP on divert. */
-	if (pfsn_upcall_on && proto == IPPROTO_UDP)
+	 * fail-fast has no SYN to retransmit for TCP, so leave TCP on divert.
+	 *
+	 * DNS (port 53) also falls through: its divert rules stay loaded so the
+	 * daemon can read answers and learn hostnames, and upcalling it too would
+	 * double-handle every query and put a needless EAGAIN on the resolver's
+	 * first packet to each server. */
+	if (pfsn_upcall_on && proto == IPPROTO_UDP && ntohs(fport) != 53)
 		return (pfsn_upcall(af, proto, faddr, fport, info,
 		    (so->so_state & SS_NBIO) != 0));
 	return (0);
