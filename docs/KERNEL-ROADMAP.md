@@ -18,7 +18,7 @@ Every phase must survive the stress/fuzz harness under the debug kernel
 |---|---|---|
 | 1 | Attribution oracle | **Done** — tested under INVARIANTS/WITNESS |
 | 2 | In-kernel verdict cache (cached deny → EPERM at connect) | **Done** — tested under INVARIANTS/WITNESS |
-| 3 | Fail-fast upcall — decide misses in-kernel, no divert | Next |
+| 3 | Fail-fast upcall — decide misses in-kernel, no divert | **Kernel done** (TCP+UDP, tested under INVARIANTS/WITNESS); daemon reader thread next |
 | 4 | Slim the divert — in-kernel per-packet TCP **and UDP** | After 3 |
 | 5 | Failmode + hardening | After 4 |
 
