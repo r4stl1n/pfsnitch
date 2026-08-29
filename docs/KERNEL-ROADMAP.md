@@ -18,8 +18,8 @@ Every phase must survive the stress/fuzz harness under the debug kernel
 |---|---|---|
 | 1 | Attribution oracle | **Done** — tested under INVARIANTS/WITNESS |
 | 2 | In-kernel verdict cache (cached deny → EPERM at connect) | **Done** — tested under INVARIANTS/WITNESS |
-| 3 | Fail-fast upcall — decide misses in-kernel, no divert | **Kernel done** (TCP+UDP, tested under INVARIANTS/WITNESS); daemon reader thread next |
-| 4 | Slim the divert — in-kernel per-packet TCP **and UDP** | After 3 |
+| 3 | Fail-fast upcall — decide misses in-kernel, no divert | **Done** — kernel + daemon reader, tested end-to-end (TCP+UDP) |
+| 4 | Slim the divert — in-kernel per-packet **UDP** (keep TCP on divert) | Next |
 | 5 | Failmode + hardening | After 4 |
 
 > **The key realisation.** The destination-bearing hook `socket_check_connect`
@@ -168,32 +168,41 @@ survives the stress/fuzz harness under `GENERIC-DEBUG`.
 
 ## Phase 4 — Slim the divert (the per-packet UDP win)
 
-**Goal.** With Phases 2–3 deciding both hits and misses in the hook, remove the
-broad `divert-to` rules so cache-hit traffic — TCP *and unconnected UDP* — is
-decided by an in-kernel lookup per packet instead of a userspace round trip.
-**This is where the per-packet UDP overhead goes away.**
+**Goal.** Remove the **UDP** `divert-to` rule so unconnected UDP is decided by an
+in-kernel lookup per datagram instead of a userspace round trip. **This is where
+the per-packet UDP overhead goes away.**
+
+**Refined by the Phase 3 integration test — keep TCP on divert.** Fail-fast
+returns `EAGAIN` with no packet sent, so:
+- **UDP is a natural fit.** QUIC's retransmission *is* re-calling `sendto`, which
+  re-enters the hook — so a first-datagram `EAGAIN` is carried transparently, and
+  once cached every datagram is an in-kernel lookup. The overhead is gone.
+- **TCP is not.** No SYN is sent on the `EAGAIN`, so nothing retransmits the
+  `connect()` — the app must retry it, which not all clients do. Meanwhile the
+  existing **divert-hold already handles TCP connect transparently** (the SYN is
+  sent, dropped, and carried by TCP's own retries) and costs only one round trip
+  *per connection*, which was never the overhead. So leave TCP on divert.
+
+Net: the hook upcalls for **UDP only**; TCP misses fall through to the divert
+path as today.
 
 **Kernel / daemon work.**
-- Drop the general TCP-SYN and UDP `divert-to` rules from the anchor. Keep only
-  the **DNS (port 53) pair**, because hostname learning needs the answer payload,
-  which no hook exposes.
-- Verify the steady state: each datagram to an already-decided destination is one
-  `socket_check_connect` → cache lookup → `0`/`EPERM`, entirely in-kernel. Make
-  that lookup cheap under load — an `rmlock` for the cache (read-mostly) rather
-  than the current `rwlock` if contention shows up at high packet rates.
-
-**Flow change.** TCP and UDP alike: first packet decided by the upcall (Phase 3),
-every subsequent packet by an in-kernel cache lookup, no divert. DNS answers
-still ride the minimal port-53 divert lane to feed the hostname map.
+- Gate the hook's upcall on `proto == IPPROTO_UDP`; a TCP miss returns 0 (divert).
+- Drop the general **UDP** `divert-to` rule from the anchor; keep the TCP-SYN
+  rule and the **DNS (port 53) pair** (hostname learning needs the answer
+  payload, which no hook exposes).
+- Verify the steady state: each UDP datagram to an already-decided destination is
+  one `socket_check_connect` → cache lookup → `0`/`EPERM`, entirely in-kernel.
+  Make that lookup cheap — move the cache to an `rmlock` (read-mostly) if the
+  `rwlock` contends at high packet rates.
 
 **Risks / decisions.**
-- **Do not silently drop a class of traffic.** Every divert lane removed must
-  have a proven in-hook replacement first — especially: does every UDP path that
-  matters actually carry `msg_name` through `kern_sendit` to the hook? (Connected
-  UDP that then `send()`s without a name is decided once at connect; verify.)
+- **Do not silently drop a class of traffic.** Confirm every UDP path that
+  matters carries `msg_name` to the hook (connected UDP that then `send()`s
+  without a name is decided once at its `connect`; verify), and that removing the
+  UDP divert rule leaves no unconnected-UDP path ungoverned.
 - **Per-packet hook cost.** A cache lookup per datagram is far cheaper than a
-  divert round trip, but it is not free — measure it, and move to `rmlock` if
-  needed.
+  divert round trip, but not free — measure it, `rmlock` if needed.
 
 ---
 
