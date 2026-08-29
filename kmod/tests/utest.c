@@ -36,6 +36,7 @@
 static int dev;
 static _Atomic int stop;
 static _Atomic int udp_events;	/* count of UDP events the "daemon" saw */
+static _Atomic int tcp_events;	/* TCP events - should stay 0: TCP is not upcalled */
 static int fails;
 
 /* The daemon: deliver events, resolve by destination port. */
@@ -52,6 +53,8 @@ daemon_thread(void *arg)
 			continue;
 		if (ev.proto == IPPROTO_UDP)
 			atomic_fetch_add(&udp_events, 1);
+		else
+			atomic_fetch_add(&tcp_events, 1);
 
 		struct pfsnitch_resolve r;
 		memset(&r, 0, sizeof(r));
@@ -218,14 +221,15 @@ main(int argc, char **argv)
 	printf("utest: upcall on; toy policy allow:%d deny:%d\n",
 	    ALLOW_PORT, DENY_PORT);
 
-	/* TCP: allowed port resolves to allow (connect proceeds -> ECONNREFUSED,
-	 * nothing listening); denied port resolves to EPERM. */
+	/* TCP is NOT upcalled (Phase 4 gate): a miss falls straight through, so
+	 * both ports just get ECONNREFUSED and the daemon never sees a TCP event.
+	 * TCP stays on the divert-hold, which this isolated test does not set up. */
 	printf("  [TCP allow] attempting...\n");
-	expect("TCP allow -> not blocked", attempt(0, ALLOW_PORT), ECONNREFUSED);
+	expect("TCP miss falls through (allow port)", attempt(0, ALLOW_PORT), ECONNREFUSED);
 	printf("  [TCP deny] attempting...\n");
-	expect("TCP deny  -> EPERM",       attempt(0, DENY_PORT), EPERM);
+	expect("TCP miss falls through (deny port)",  attempt(0, DENY_PORT), ECONNREFUSED);
 
-	/* UDP: the case that matters. sendto() must reach the hook, so the miss
+	/* UDP is the case that matters. sendto() reaches the hook, so the miss
 	 * upcalls; allow -> sendto succeeds, deny -> EPERM. */
 	printf("  [UDP allow] attempting...\n");
 	expect("UDP allow -> sendto ok",   attempt(1, ALLOW_PORT), 0);
@@ -233,9 +237,11 @@ main(int argc, char **argv)
 	expect("UDP deny  -> EPERM",       attempt(1, DENY_PORT), EPERM);
 
 	int udp_seen = atomic_load(&udp_events);
-	printf("  UDP events delivered to daemon: %d %s\n", udp_seen,
-	    udp_seen > 0 ? "PASS" : "FAIL");
-	if (udp_seen == 0)
+	int tcp_seen = atomic_load(&tcp_events);
+	printf("  UDP events delivered: %d %s\n", udp_seen, udp_seen > 0 ? "PASS" : "FAIL");
+	printf("  TCP events delivered: %d %s (must be 0: TCP is not upcalled)\n",
+	    tcp_seen, tcp_seen == 0 ? "PASS" : "FAIL");
+	if (udp_seen == 0 || tcp_seen != 0)
 		fails++;
 
 	atomic_store(&stop, 1);

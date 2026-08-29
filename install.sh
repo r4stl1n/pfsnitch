@@ -32,8 +32,9 @@ for f in libexec/pfsnitch-*; do
 done
 
 install -m 755 rc.d/pfsnitch "$PREFIX/etc/rc.d/pfsnitch"
-install -m 644 etc/anchor.conf   "$ETCDIR/anchor.conf"
-install -m 644 etc/failopen.conf "$ETCDIR/failopen.conf"
+install -m 644 etc/anchor.conf    "$ETCDIR/anchor.conf"
+install -m 644 etc/udpdivert.conf "$ETCDIR/udpdivert.conf"
+install -m 644 etc/failopen.conf  "$ETCDIR/failopen.conf"
 
 # Never overwrite a live policy - it is the user's rule set, not ours.
 if [ -f "$ETCDIR/policy.conf" ]; then

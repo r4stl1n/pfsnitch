@@ -561,10 +561,13 @@ pfsn_socket_check_connect(struct ucred *cred, struct socket *so,
 	if (verdict == PFSNITCH_V_ALLOW)
 		return (0);
 
-	/* Miss. If the daemon is servicing upcalls (Phase 3), ask it: enqueue and
-	 * return EAGAIN so the app retries once the answer is cached. Otherwise
-	 * fall through (return 0) and let the divert path decide, as in Phase 2. */
-	if (pfsn_upcall_on)
+	/* Miss. Upcall for UDP only (Phase 4): a UDP miss - unconnected sendto
+	 * included, since kern_sendit routes it through this hook - is decided
+	 * here so the UDP divert rule can be retired and every later datagram is a
+	 * bare cache lookup. TCP misses fall through (return 0) to the divert-hold,
+	 * which carries a held connect() transparently via SYN retransmission;
+	 * fail-fast has no SYN to retransmit for TCP, so leave TCP on divert. */
+	if (pfsn_upcall_on && proto == IPPROTO_UDP)
 		return (pfsn_upcall(af, proto, faddr, fport, info,
 		    (so->so_state & SS_NBIO) != 0));
 	return (0);

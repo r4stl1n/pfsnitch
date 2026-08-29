@@ -29,6 +29,10 @@ use std::time::{Duration, Instant};
 const DIVERT_PORT: u16 = 8668;
 const POLICY_PATH: &str = "/usr/local/etc/pfsnitch/policy.conf";
 const PROMPT_BIN: &str = "/usr/local/libexec/pfsnitch-prompt";
+// Phase 4: the sub-anchor holding the all-UDP divert rule. The daemon empties
+// it while the kernel upcall governs UDP, and reloads it otherwise.
+const UDPDIVERT_ANCHOR: &str = "pfsnitch/udpdivert";
+const UDPDIVERT_CONF: &str = "/usr/local/etc/pfsnitch/udpdivert.conf";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -318,6 +322,38 @@ struct Pending {
     dport: u16,
 }
 
+/// Turn the all-UDP divert on or off by loading or flushing the `udpdivert`
+/// sub-anchor. `divert=false` empties it, so unconnected UDP stops taking the
+/// userspace round trip and is governed by the kernel upcall instead;
+/// `divert=true` reloads it so UDP is never left ungoverned. Best-effort: if pf
+/// is not running the pfctl call just fails and is logged, which is correct —
+/// there is nothing to divert to or from.
+fn set_udp_divert(divert: bool) {
+    let out = if divert {
+        Command::new("/sbin/pfctl")
+            .args(["-a", UDPDIVERT_ANCHOR, "-f", UDPDIVERT_CONF])
+            .output()
+    } else {
+        Command::new("/sbin/pfctl")
+            .args(["-a", UDPDIVERT_ANCHOR, "-F", "rules"])
+            .output()
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            eprintln!(
+                "pfsnitch: UDP divert {} - unconnected UDP is now governed {}",
+                if divert { "reloaded" } else { "flushed" },
+                if divert { "by the userspace divert path" } else { "in-kernel (no divert)" }
+            );
+        }
+        Ok(o) => eprintln!(
+            "pfsnitch: pfctl {UDPDIVERT_ANCHOR}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("pfsnitch: pfctl {UDPDIVERT_ANCHOR}: {e}"),
+    }
+}
+
 /// Open the kernel attribution device if the policy asks for it, saying what
 /// happened either way: a policy naming a module that is not loaded must be
 /// noticed, not silently downgraded to the userspace path.
@@ -590,7 +626,11 @@ fn run(fallback_mode: policy::Mode) {
                             }
                         });
                         upcall_on = true;
-                        eprintln!("pfsnitch: upcall enabled - misses decided in-kernel");
+                        // UDP is now governed by the hook, so retire its divert
+                        // rule: every later datagram becomes a bare in-kernel
+                        // cache lookup instead of a userspace round trip.
+                        set_udp_divert(false);
+                        eprintln!("pfsnitch: upcall enabled - UDP misses decided in-kernel");
                     }
                     Err(e) => eprintln!("pfsnitch: upcall reader open failed: {e}"),
                 }
@@ -600,6 +640,8 @@ fn run(fallback_mode: policy::Mode) {
                 // Any waiters will never be answered now; drop them - their apps
                 // fall back to the divert path on retry.
                 pending_upcalls.clear();
+                // Put UDP back on divert so it is never left ungoverned.
+                set_udp_divert(true);
                 eprintln!("pfsnitch: upcall disabled");
             }
         }
