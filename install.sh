@@ -17,12 +17,14 @@ PREFIX="${PREFIX:-/usr/local}"
 ETCDIR="$PREFIX/etc/pfsnitch"
 ASSUME_YES=0
 DO_ARM=1
+DO_KMOD=1
 
 for a in "$@"; do
     case "$a" in
-        --yes|-y)  ASSUME_YES=1 ;;
-        --no-arm)  DO_ARM=0 ;;
-        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --yes|-y)   ASSUME_YES=1 ;;
+        --no-arm)   DO_ARM=0 ;;
+        --no-kmod)  DO_KMOD=0 ;;   # skip the kernel module entirely (userspace path only)
+        -h|--help)  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "install.sh: unknown option $a (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -82,7 +84,9 @@ info "built target/release/pfsnitch"
 # --- build the kernel module (optional) ------------------------------------
 say "Kernel attribution module (optional - the userspace path works without it)"
 KMOD=0
-if [ -f kmod/mac_pfsnitch.ko ]; then
+if [ "$DO_KMOD" = 0 ]; then
+    info "skipped (--no-kmod) - using the userspace path"
+elif [ -f kmod/mac_pfsnitch.ko ]; then
     info "already built."; KMOD=1
 elif [ -d /usr/src/sys ] && command -v make >/dev/null 2>&1; then
     if ( cd kmod && make ) >/tmp/pfsnitch-kmod-build.log 2>&1; then
@@ -161,8 +165,9 @@ if ! ask "Proceed with arming?" y; then
     exit 0
 fi
 
-# 1. daemon first
-service pfsnitch start || die "daemon failed to start - NOT touching /etc/pf.conf"
+# 1. daemon first (restart, so an update-in-place picks up the new binary; on a
+#    fresh box restart is just a start)
+service pfsnitch restart || die "daemon failed to start - NOT touching /etc/pf.conf"
 
 # 2. pf.conf - carefully
 if { [ -f /etc/pf.conf ] && grep -q 'anchor "pfsnitch"' /etc/pf.conf; }; then
