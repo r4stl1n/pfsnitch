@@ -86,6 +86,38 @@ with the prompt saying so in red.
 FreeBSD binaries are generally unsigned, so a content hash stands in for the code
 signature Little Snitch uses.
 
+## Two ways to name the process, one of them in the kernel
+
+Attribution — which binary owns this connection — has two backends, switchable
+at runtime like `mode`:
+
+```sh
+pfsnitch attribution procstat    # scan the process table (default, no moving parts)
+pfsnitch attribution kernel      # ask the optional mac_pfsnitch.ko module
+```
+
+The default reconstructs identity backwards from the packet, by scanning every
+process's file table — which costs milliseconds and races a process that
+connects and exits. The kernel module records identity **forwards**, at
+`socket(2)` time in the creating process's own context: exact, race-free, one
+ioctl to ask, and it still names a process that quit right after connecting.
+Sockets the module never saw (started before it loaded) silently fall back to
+the scan, and the log says which backend answered each flow.
+
+The module does more than name the process, though **policy always stays in the
+daemon** — the module only ever replays decisions the daemon already made. In
+enforcement it caches those verdicts and enforces them at the socket layer: a
+denied flow fails `connect()` immediately, and **UDP is decided in the kernel
+per packet** (its divert rule retired), so there is no per-datagram userspace
+round trip. TCP keeps its transparent divert-hold; DNS and loopback are exempt.
+
+One honest difference to know: because the module decides UDP at `connect()`
+time, it can prompt once for a *connected*-UDP flow that the divert path never
+saw — including a `connect()` that sends no datagram (some libraries connect a
+UDP socket just to pick a source address). It is a one-time cost per
+destination, then cached. Build it from `kmod/`; the full picture, caveats, and
+this behaviour are in [docs/KERNEL.md](docs/KERNEL.md).
+
 ## Blocked means refused, not hung
 
 A settled deny synthesises a TCP reset, so the application gets
@@ -148,6 +180,12 @@ reinjection. Verdicts are cached per flow - without that, one video stream pegge
 a core and the daemon dropped 99% of the traffic it was supposed to be judging.
 With it, a streaming rate costs about 0.5% CPU.
 
+Those numbers are the **divert path's** cost. With the optional kernel module
+governing UDP (`attribution kernel`, enforcement), the per-datagram userspace
+round trip goes away entirely: each UDP packet is decided by an in-kernel cache
+lookup, and the divert rule for UDP is retired. See
+[docs/KERNEL.md](docs/KERNEL.md).
+
 See [docs/SAFETY.md](docs/SAFETY.md#what-this-costs) for the measurements, and
 for why the obvious fix to the TCP cost does not work.
 
@@ -185,24 +223,43 @@ Hostnames come from snooping plaintext DNS replies. DNS-over-HTTPS is invisible
 to this, and such connections appear as bare addresses.
 
 Outbound UDP is diverted too, not just TCP - otherwise QUIC/HTTP3 would bypass
-the whole tool. UDP costs more than TCP does (every packet is diverted, and a
-dropped datagram is not retransmitted); see [docs/SAFETY.md](docs/SAFETY.md).
+the whole tool. On the divert path UDP costs more than TCP (every packet is
+diverted); the optional kernel module removes that by deciding UDP in the kernel
+per packet — see [docs/KERNEL.md](docs/KERNEL.md).
+
+The picture above is the always-present userspace path. The kernel module is an
+opt-in layer *on top of* it — it makes attribution exact and moves UDP filtering
+into the kernel, but the daemon still holds all policy and decides every first
+contact. It is never a replacement for the daemon, and anything it cannot answer
+falls back to the path above.
 
 ## Install
 
-FreeBSD, `pf` enabled. `libc` is the only build dependency — deliberately, for a
+FreeBSD, with `pf`. `libc` is the only build dependency — deliberately, for a
 firewall.
 
 ```sh
-cargo build --release
 doas ./install.sh
 ```
 
-The installer stops short of touching `/etc/pf.conf` or starting anything: this
-tool sits in the packet path, and that last step should be a decision you make
-while looking at the machine. It prints the three remaining commands.
+One command: it builds the daemon (and the optional kernel module, if
+`/usr/src` is present), installs everything, wires it to start at boot, and —
+after asking — arms it. The one part that touches live traffic (editing
+`/etc/pf.conf`, turning `pf` on, starting the firewall) is done **last**, and in
+the only ordering that cannot strand the machine: the daemon starts first in
+**visibility** mode (every packet reinjected, nothing blocked), and only then is
+`pf` pointed at it. Inbound SSH and DHCP stay open throughout, and a crash fails
+open via the watchdog, so a remote box is never locked out.
 
-Start in `visibility` and watch what it learns before you enforce anything.
+```sh
+doas ./install.sh --yes      # arm without the confirmation prompt
+doas ./install.sh --no-arm   # build + install only; arm it yourself later
+```
+
+It never overwrites your `policy.conf`, and it won't rewrite a `pf.conf` you've
+already customised — it prints the two lines to add instead. Start in
+`visibility`, review what it learns with `pfsnitch apps`, then
+`pfsnitch mode enforcement` when the rules look right.
 
 If it ever locks you out, `pfsnitch-panic` is in `PATH`, takes no arguments, and
 disables pf outright.

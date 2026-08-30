@@ -52,6 +52,10 @@ pub struct Tuple {
 /// prompt says which one was used rather than pretending they are equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
+    /// Named by mac_pfsnitch.ko, which recorded the owner at socket creation
+    /// in the creating process's own context. Stronger than `Exact`: not a
+    /// scan that raced the process table, but the kernel's own answer.
+    Kernel,
     /// Full 4-tuple. A connected socket; unambiguous.
     Exact,
     /// Peer-less socket, matched on (proto, local address, local port).
@@ -64,6 +68,7 @@ pub enum Confidence {
 impl Confidence {
     pub fn as_str(self) -> &'static str {
         match self {
+            Confidence::Kernel => "kernel",
             Confidence::Exact => "exact",
             Confidence::Local => "local",
             Confidence::Port => "port",
@@ -297,7 +302,10 @@ pub fn snapshot() -> Tables {
             // Executable path. Falls back to the command name if the binary is
             // gone (deleted or replaced while running) - which is itself worth
             // noticing, so it is recorded as such rather than silently blank.
-            let mut pathbuf = [0i8; 1024];
+            // c_char, not i8: signedness of char differs by architecture
+            // (i8 on x86_64, u8 on aarch64), and a literal type would only
+            // compile on one of them.
+            let mut pathbuf = [0 as libc::c_char; 1024];
             let path = if procstat_getpathname(ps, p, pathbuf.as_mut_ptr(), pathbuf.len()) == 0 {
                 let s = CStr::from_ptr(pathbuf.as_ptr()).to_string_lossy().into_owned();
                 if s.is_empty() { format!("<unknown:{command}>") } else { s }
@@ -316,7 +324,7 @@ pub fn snapshot() -> Tables {
             while !fst.is_null() {
                 if (*fst).fs_type == PS_FST_TYPE_SOCKET as i32 {
                     let mut sock: sockstat = std::mem::zeroed();
-                    let mut errbuf = [0i8; 256];
+                    let mut errbuf = [0 as libc::c_char; 256];
                     if procstat_get_socket_info(ps, fst, &mut sock, errbuf.as_mut_ptr()) == 0 {
                         let proto = sock.proto as u8;
                         match (endpoint(&sock.sa_local), endpoint(&sock.sa_peer)) {
@@ -591,6 +599,7 @@ mod tests {
     fn confidence_strings_are_stable() {
         // The prompt contract passes these as argv; renaming one silently would
         // change what a frontend displays.
+        assert_eq!(Confidence::Kernel.as_str(), "kernel");
         assert_eq!(Confidence::Exact.as_str(), "exact");
         assert_eq!(Confidence::Local.as_str(), "local");
         assert_eq!(Confidence::Port.as_str(), "port");

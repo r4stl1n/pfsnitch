@@ -80,6 +80,30 @@ impl Divert {
         }
     }
 
+    /// Bound how long `recv` blocks. With no diverted traffic the daemon would
+    /// otherwise sleep in `recvfrom` indefinitely; a timeout lets the loop keep
+    /// ticking to service the upcall channel and periodic work. On expiry `recv`
+    /// returns an error of kind `WouldBlock`.
+    pub fn set_read_timeout(&self, ms: u64) -> io::Result<()> {
+        let tv = libc::timeval {
+            tv_sec: (ms / 1000) as libc::time_t,
+            tv_usec: ((ms % 1000) * 1000) as libc::suseconds_t,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Block until a packet is diverted to us. Returns the raw IP packet and
     /// the sockaddr it arrived with, which must be passed back to reinject.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, libc::sockaddr_in)> {

@@ -23,6 +23,10 @@ load_rc_config $name
 : ${pfsnitch_enable:="NO"}
 : ${pfsnitch_mode:="visibility"}          # visibility | enforcement (policy file wins)
 : ${pfsnitch_anchor:="/usr/local/etc/pfsnitch/anchor.conf"}
+# The all-UDP divert rule lives in the pfsnitch/udpdivert sub-anchor so the
+# daemon can retire it while the kernel module governs UDP. Loaded here so UDP
+# diverts by default; the daemon empties it when its upcall takes over.
+: ${pfsnitch_udpdivert:="/usr/local/etc/pfsnitch/udpdivert.conf"}
 : ${pfsnitch_watchdog:="YES"}
 
 # What the watchdog does if a RUNNING daemon dies. Boot is always closed (the
@@ -165,6 +169,17 @@ pfsnitch_poststart() {
         pfsnitch_failsafe "anchor failed to load"
         return 1
     }
+    # Load the UDP-divert sub-anchor so UDP diverts by default. The daemon
+    # empties it once its kernel upcall is governing UDP; leaving it empty here
+    # without the upcall would let UDP bypass, so it is loaded, not skipped.
+    pfctl -a pfsnitch/udpdivert -f "${pfsnitch_udpdivert}" 2>/dev/null ||
+        warn "udpdivert sub-anchor failed to load from ${pfsnitch_udpdivert}"
+    # Keep the kernel module's fail default (used when its upcall queue fills or
+    # no daemon answers) in step with this service's. No-op if not loaded.
+    case "${pfsnitch_failmode}" in
+    closed) sysctl security.mac.pfsnitch.failmode=1 >/dev/null 2>&1 ;;
+    *)      sysctl security.mac.pfsnitch.failmode=0 >/dev/null 2>&1 ;;
+    esac
     # `&` alone leaves stdout attached to the rc script, and `service` then
     # blocks waiting for EOF. daemon(8) detaches it properly.
     if [ "${pfsnitch_watchdog}" = "YES" ]; then
@@ -228,6 +243,10 @@ pfsnitch_reload() {
         warn "anchor failed to load; leaving the previous rules in place"
         return 1
     }
+    # Restore the UDP-divert sub-anchor. If the daemon is running with its upcall
+    # active it will empty this again within a second; if not, UDP must divert.
+    pfctl -a pfsnitch/udpdivert -f "${pfsnitch_udpdivert}" 2>/dev/null ||
+        warn "udpdivert sub-anchor failed to load from ${pfsnitch_udpdivert}"
     echo "Reloaded pfsnitch anchor."
 }
 
@@ -245,6 +264,8 @@ pfsnitch_load_anchor() {
             warn "anchor failed to load from ${pfsnitch_anchor}"
             return 1
         }
+        pfctl -a pfsnitch/udpdivert -f "${pfsnitch_udpdivert}" 2>/dev/null ||
+            warn "udpdivert sub-anchor failed to load from ${pfsnitch_udpdivert}"
         echo "pfsnitch anchor loaded ($(pfctl -a pfsnitch -s rules 2>/dev/null | wc -l | tr -d ' ') rules, daemon running)."
     else
         warn "pfsnitch is not running - not installing divert rules"
@@ -255,6 +276,9 @@ pfsnitch_load_anchor() {
 
 pfsnitch_poststop() {
     pfctl -a pfsnitch -F rules >/dev/null 2>&1
+    # Stop the kernel module upcalling and drop its cache now that no daemon
+    # serves them; a no-op if the module is not loaded.
+    pfsnitch kernel-reset >/dev/null 2>&1 || true
     rm -f /var/run/pfsnitch/answer /var/run/pfsnitch/nonce 2>/dev/null
 }
 

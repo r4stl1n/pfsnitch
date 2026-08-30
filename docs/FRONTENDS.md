@@ -128,10 +128,18 @@ Attribution is tiered, because not every socket carries the same evidence.
 
 | tier | matched on | typical case |
 |---|---|---|
+| `kernel` | identity recorded at socket creation by `mac_pfsnitch.ko` | any socket created while the optional kernel module was loaded — see `docs/KERNEL.md` |
 | `exact` | the full 4-tuple of a connected socket | anything that called `connect()` — all TCP, and libc's resolver |
 | `local` | an unconnected socket's bound address and port | `sendto()` senders: ntpd, mDNS, SSDP, DHCP clients |
 | `port`  | an unconnected socket's local port alone | a wildcard bind such as `*:123` |
 | `none`  | nothing matched | kernel-originated traffic (ICMP, IPv6 ND), or a process that exited first |
+
+`kernel` is stronger than `exact`, not merely equal to it: the other tiers are
+a userspace scan of the process table that races against process exit, while
+`kernel` is the kernel's own record, written in the creating process's context
+at `socket(2)` time. It appears only when `attribution kernel` is set in the
+policy and the module is loaded; a frontend that predates it can treat it like
+`exact` — every tier except `none` behaves the same way at the prompt.
 
 The two weak tiers exist because requiring a peer address made every
 *unconnected* UDP socket invisible. `sendto()` without `connect()` leaves the

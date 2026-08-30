@@ -13,6 +13,7 @@
 mod dns;
 mod divert;
 mod identity;
+mod kernattr;
 mod policy;
 mod procinfo;
 mod seen;
@@ -22,12 +23,29 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// Set by the SIGTERM/SIGINT handler so the run loop can undo the kernel and pf
+/// state it established (upcall on, UDP divert flushed, verdict cache) before
+/// exiting. A panic aborts (`panic = "abort"`) and cannot run this — that path
+/// is covered by the watchdog and by the kernel auto-disabling the upcall on the
+/// last close of /dev/pfsnitch.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_sig: libc::c_int) {
+    // Async-signal-safe: only a relaxed atomic store.
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 
 const DIVERT_PORT: u16 = 8668;
 const POLICY_PATH: &str = "/usr/local/etc/pfsnitch/policy.conf";
 const PROMPT_BIN: &str = "/usr/local/libexec/pfsnitch-prompt";
+// Phase 4: the sub-anchor holding the all-UDP divert rule. The daemon empties
+// it while the kernel upcall governs UDP, and reloads it otherwise.
+const UDPDIVERT_ANCHOR: &str = "pfsnitch/udpdivert";
+const UDPDIVERT_CONF: &str = "/usr/local/etc/pfsnitch/udpdivert.conf";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,6 +59,8 @@ fn main() {
         "rm" | "remove" => cmd_rm(&args),
         "status" => cmd_status(&args),
         "mode" => cmd_mode(&args),
+        "attribution" => cmd_attribution(&args),
+        "kernel-reset" => cmd_kernel_reset(),
         "apps" => cmd_apps(&args),
         "forget" => cmd_forget(&args),
         "clear" => cmd_clear(&args),
@@ -70,6 +90,12 @@ rules (any frontend can drive these - see --json):
   pfsnitch mode [visibility|enforcement]
                               show or switch mode; takes effect within a second,
                               with no restart and no gap in coverage
+  pfsnitch attribution [kernel|procstat]
+                              show or switch how flows are matched to processes:
+                              procstat scans the process table from userspace;
+                              kernel asks mac_pfsnitch.ko, which recorded the
+                              owner at socket creation (exact, race-free, and
+                              falls back to procstat for unlabeled sockets)
   pfsnitch allow host <name>  approve a hostname, and every address it resolves to
   pfsnitch allow app <path>   approve a binary for all destinations
   pfsnitch allow dest <ip>    approve one address (v4 or v6)
@@ -310,10 +336,67 @@ struct Pending {
     dport: u16,
 }
 
+/// Turn the all-UDP divert on or off by loading or flushing the `udpdivert`
+/// sub-anchor. `divert=false` empties it, so unconnected UDP stops taking the
+/// userspace round trip and is governed by the kernel upcall instead;
+/// `divert=true` reloads it so UDP is never left ungoverned. Best-effort: if pf
+/// is not running the pfctl call just fails and is logged, which is correct —
+/// there is nothing to divert to or from.
+fn set_udp_divert(divert: bool) {
+    let out = if divert {
+        Command::new("/sbin/pfctl")
+            .args(["-a", UDPDIVERT_ANCHOR, "-f", UDPDIVERT_CONF])
+            .output()
+    } else {
+        Command::new("/sbin/pfctl")
+            .args(["-a", UDPDIVERT_ANCHOR, "-F", "rules"])
+            .output()
+    };
+    match out {
+        Ok(o) if o.status.success() => {
+            eprintln!(
+                "pfsnitch: UDP divert {} - unconnected UDP is now governed {}",
+                if divert { "reloaded" } else { "flushed" },
+                if divert { "by the userspace divert path" } else { "in-kernel (no divert)" }
+            );
+        }
+        Ok(o) => eprintln!(
+            "pfsnitch: pfctl {UDPDIVERT_ANCHOR}: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => eprintln!("pfsnitch: pfctl {UDPDIVERT_ANCHOR}: {e}"),
+    }
+}
+
+/// Open the kernel attribution device if the policy asks for it, saying what
+/// happened either way: a policy naming a module that is not loaded must be
+/// noticed, not silently downgraded to the userspace path.
+fn kern_backend(pol: &policy::Policy) -> Option<kernattr::KernAttr> {
+    if pol.attribution() != policy::AttributionMode::Kernel {
+        return None;
+    }
+    match kernattr::KernAttr::open() {
+        Ok(k) => {
+            eprintln!("pfsnitch: attribution: kernel (mac_pfsnitch.ko), procstat as fallback");
+            // Start from a known-empty cache: the daemon's policy is the
+            // authority, and any entries a previous daemon left behind must not
+            // outlive it.
+            k.flush_verdicts();
+            Some(k)
+        }
+        Err(e) => {
+            eprintln!("pfsnitch: attribution kernel requested but /dev/pfsnitch: {e}");
+            eprintln!("  using procstat until the module is loaded (kldload mac_pfsnitch)");
+            None
+        }
+    }
+}
+
 fn run(fallback_mode: policy::Mode) {
     let policy_path = Path::new(POLICY_PATH);
     let mut pol = policy::Policy::load(policy_path);
     let mut mode = pol.mode(fallback_mode);
+    let mut kern = kern_backend(&pol);
     let mut pol_mtime = policy::mtime(policy_path);
     let mut last_check = Instant::now();
     // Resolved once: env var, then the policy file's `prompt` directive, then
@@ -341,8 +424,30 @@ fn run(fallback_mode: policy::Mode) {
         eprintln!("  talks to. Prompts appear only in enforcement, where there is a decision to make.");
     }
 
+    // Keep the loop ticking without divert traffic so the upcall channel and
+    // periodic work are serviced promptly.
+    let _ = d.set_read_timeout(100);
+
+    // Clean up the kernel/pf state on a graceful signal. (The rc.d stop path
+    // and the watchdog also cover this; this closes the gap for a plain
+    // `kill -TERM` with neither around.)
+    unsafe {
+        libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
+    }
+
     // Answers arrive from prompt threads; the read loop must never block on one.
     let (tx, rx) = mpsc::channel::<(Answer, Pending)>();
+
+    // Phase 3 upcall: the reader thread delivers cache-miss events here; the
+    // main loop decides and RESOLVEs them, keeping all policy state single-
+    // threaded. `upcall_on` tracks whether the hook is asking us (enabled only
+    // with the kernel backend, in enforcement - visibility must never block).
+    // `pending_upcalls` holds event ids awaiting a prompt answer, keyed exactly
+    // like `asking`, so one answer resolves every miss it covers.
+    let (utx, urx) = mpsc::channel::<kernattr::KernEvent>();
+    let mut upcall_on = false;
+    let mut pending_upcalls: HashMap<(String, String), Vec<u64>> = HashMap::new();
 
     let mut res = procinfo::Resolver::new();
     let mut ident = identity::Identity::new();
@@ -370,10 +475,36 @@ fn run(fallback_mode: policy::Mode) {
     let mut buf = vec![0u8; 65_535];
 
     loop {
+        // Graceful shutdown: undo what we established so a kill leaves no stale
+        // kernel/pf state behind. A signal also interrupts the recv() below, so
+        // this is reached within a tick.
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("pfsnitch: signalled - clearing kernel upcall/cache, restoring UDP divert");
+            if let Some(k) = kern.as_ref() {
+                k.set_upcall(false);
+                k.flush_verdicts();
+            }
+            if upcall_on {
+                set_udp_divert(true);
+            }
+            std::process::exit(0);
+        }
+
         // Drain any answers first so policy is current before the next verdict.
         while let Ok((ans, p)) = rx.try_recv() {
             let key = (p.exe.clone().unwrap_or_default(), ask_key(p.host.as_deref(), p.dst));
             asking.remove(&key);
+            // Any upcall misses that were waiting on this prompt get the answer
+            // now, so their retries resolve. Do this before pol.record so the
+            // kernel cache and the policy file settle together.
+            if let Some(ids) = pending_upcalls.remove(&key) {
+                let allow = matches!(ans, Answer::AllowConn | Answer::AllowApp);
+                if let Some(k) = kern.as_ref() {
+                    for id in ids {
+                        k.resolve(id, allow);
+                    }
+                }
+            }
             if let Some(e) = p.exe.as_deref() {
                 if matches!(ans, Answer::AllowConn | Answer::AllowApp) {
                     // Re-pin: if this approval follows a change warning, the
@@ -387,6 +518,61 @@ fn run(fallback_mode: policy::Mode) {
             }
             pol.record(policy_path, ans, p.exe.as_deref(), p.dst, p.host.as_deref(), p.dport, policy::Origin::Approved);
             eprintln!("  decision: {:?} for {} -> {}", ans, p.exe.as_deref().unwrap_or("?"), p.dst);
+        }
+
+        // Drain kernel upcalls: cache misses the hook is asking us to decide.
+        // Attribution is already done (the event carries the owning binary), so
+        // this is policy only, then RESOLVE - allow/deny answer at once, ask
+        // spawns a prompt and answers when the user does. Enforcement only:
+        // upcalls are never enabled in visibility.
+        while let Ok(ev) = urx.try_recv() {
+            if ev.path.is_empty() {
+                if let Some(k) = kern.as_ref() { k.resolve(ev.id, true); }
+                continue;
+            }
+            let host = names.name_for(&ev.dst).map(|s| s.to_string());
+            let mut id_changed = false;
+            if let Some(expected) = pol.expected_id(&ev.path).map(str::to_string) {
+                if let Some(actual) = ident.hash(&ev.path) {
+                    if actual != expected {
+                        id_changed = true;
+                        if id_warned.insert(ev.path.clone()) {
+                            eprintln!(
+                                "pfsnitch: BINARY CHANGED {}\n  approved {expected}\n  now      {actual}\n  its rules are being ignored until you approve it again",
+                                ev.path
+                            );
+                        }
+                    }
+                }
+            }
+            let verdict = if id_changed {
+                Verdict::Ask
+            } else {
+                pol.decide(Some(&ev.path), ev.dst, host.as_deref(), ev.dport)
+            };
+            match verdict {
+                Verdict::Allow => { if let Some(k) = kern.as_ref() { k.resolve(ev.id, true); } }
+                Verdict::Deny => { if let Some(k) = kern.as_ref() { k.resolve(ev.id, false); } }
+                Verdict::Ask => {
+                    let hostname = host.clone().unwrap_or_default();
+                    let key = (
+                        ev.path.clone(),
+                        ask_key(if hostname.is_empty() { None } else { Some(&hostname) }, ev.dst),
+                    );
+                    if asking.insert(key.clone()) {
+                        let cmd = ev.path.rsplit('/').next().unwrap_or(&ev.path).to_string();
+                        spawn_prompt(
+                            prompt_bin.clone(), id_changed, tx.clone(),
+                            Some(ev.path.clone()), ev.pid, cmd,
+                            ev.dst, ev.dport, hostname, "kernel".to_string(),
+                        );
+                    }
+                    // Answered when the prompt returns; see the rx drain above.
+                    pending_upcalls.entry(key).or_default().push(ev.id);
+                }
+            }
+            let dest = host.as_deref().unwrap_or("-");
+            eprintln!("  upcall {verdict:?}  {} -> {} ({dest}) :{}", ev.path, ev.dst, ev.dport);
         }
 
         // Pick up edits from any source - our own CLI, an editor, a frontend.
@@ -405,16 +591,67 @@ fn run(fallback_mode: policy::Mode) {
 
         if last_check.elapsed() >= Duration::from_secs(1) {
             last_check = Instant::now();
+
+            // Keep the kernel backend honest. kldunload revokes the open fd
+            // (every ioctl becomes ENXIO), and a re-loaded module is a NEW
+            // device the old fd will never reach - so a dead handle is dropped
+            // loudly, and while the policy still asks for kernel attribution
+            // the open is retried each tick, silently on failure (once a
+            // second is not worth a log line) and loudly on recovery.
+            if pol.attribution() == policy::AttributionMode::Kernel {
+                if kern.as_ref().is_some_and(|k| k.is_dead()) {
+                    eprintln!("pfsnitch: /dev/pfsnitch went away (module unloaded?); using procstat");
+                    kern = None;
+                } else if kern.is_none() {
+                    if let Ok(k) = kernattr::KernAttr::open() {
+                        eprintln!("pfsnitch: attribution: kernel (mac_pfsnitch.ko reconnected)");
+                        // A reloaded module has an empty cache already; flush is
+                        // belt and braces so the daemon and kernel never disagree.
+                        k.flush_verdicts();
+                        kern = Some(k);
+                    }
+                }
+            }
+
             let m = policy::mtime(policy_path);
             if m != pol_mtime {
                 pol_mtime = m;
+                let was_attr = pol.attribution();
                 pol = policy::Policy::load(policy_path);
                 let was = mode;
                 mode = pol.mode(fallback_mode);
+                if pol.attribution() != was_attr {
+                    // Tear the upcall down BEFORE replacing the handle. Otherwise
+                    // switching kernel->procstat nulls `kern` while the kernel's
+                    // upcall is still on, and nothing can reach the module to turn
+                    // it off - leaving it upcalling into a void (loopback UDP and
+                    // everything else stuck on EAGAIN). Use the still-valid handle.
+                    if upcall_on {
+                        if let Some(k) = kern.as_ref() {
+                            k.set_upcall(false);
+                        }
+                        upcall_on = false;
+                        pending_upcalls.clear();
+                        set_udp_divert(true);
+                    }
+                    // Same runtime-switch contract as mode: takes effect within
+                    // a second, never restarts the daemon or drops the socket.
+                    kern = kern_backend(&pol);
+                    if pol.attribution() == policy::AttributionMode::Procstat {
+                        eprintln!("pfsnitch: attribution: procstat (userspace)");
+                    }
+                }
                 // Every cached verdict was derived from the policy that just
                 // changed. Keeping them would mean a rule you added or removed
                 // silently not applying to traffic already in flight.
                 decided.clear();
+                // The kernel cache is derived from the policy that just changed,
+                // so it must be abandoned at the same instant as the daemon's own
+                // decided map - a cached allow or deny outliving its rule is a
+                // correctness failure. Flows re-populate it as they recur.
+                if let Some(k) = kern.as_ref() {
+                    k.flush_verdicts();
+                }
                 eprintln!("pfsnitch: policy reloaded: {}", pol.summary());
                 if mode != was {
                     // Worth its own line: this is the one setting that changes
@@ -422,10 +659,49 @@ fn run(fallback_mode: policy::Mode) {
                     eprintln!("pfsnitch: mode {} -> {}", was.as_str(), mode.as_str());
                 }
             }
+
+            // Reconcile the upcall: on only with the kernel backend, in
+            // enforcement - visibility must never drop a first packet. The
+            // reader thread is (re)spawned on enable and exits on the EOF that
+            // disabling (or unload) produces.
+            let want_upcall = kern.is_some() && mode.enforcing();
+            if want_upcall && !upcall_on {
+                match kernattr::KernReader::open() {
+                    Ok(rd) => {
+                        if let Some(k) = kern.as_ref() { k.set_upcall(true); }
+                        let utx2 = utx.clone();
+                        std::thread::spawn(move || {
+                            while let Ok(Some(ev)) = rd.read_event() {
+                                if utx2.send(ev).is_err() { break; }
+                            }
+                        });
+                        upcall_on = true;
+                        // UDP is now governed by the hook, so retire its divert
+                        // rule: every later datagram becomes a bare in-kernel
+                        // cache lookup instead of a userspace round trip.
+                        set_udp_divert(false);
+                        eprintln!("pfsnitch: upcall enabled - UDP misses decided in-kernel");
+                    }
+                    Err(e) => eprintln!("pfsnitch: upcall reader open failed: {e}"),
+                }
+            } else if !want_upcall && upcall_on {
+                if let Some(k) = kern.as_ref() { k.set_upcall(false); }
+                upcall_on = false;
+                // Any waiters will never be answered now; drop them - their apps
+                // fall back to the divert path on retry.
+                pending_upcalls.clear();
+                // Put UDP back on divert so it is never left ungoverned.
+                set_udp_divert(true);
+                eprintln!("pfsnitch: upcall disabled");
+            }
         }
 
         let (n, from) = match d.recv(&mut buf) {
             Ok(v) => v,
+            // Timed out, or a signal interrupted it: loop back to service the
+            // channels and re-check the shutdown flag.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => { eprintln!("recv: {e}"); continue; }
         };
 
@@ -504,7 +780,15 @@ fn run(fallback_mode: policy::Mode) {
                     // reinjected above. The flag stays explicit because the weak
                     // attribution tiers key on the packet's SOURCE as the local
                     // end, which is only true outbound - see procinfo::Tables::get.
-                    let att = res.resolve(&t, true);
+                    //
+                    // The kernel backend is asked first when configured; a miss
+                    // there is normal (a socket from before the module loaded)
+                    // and falls through to the procstat scan, with the
+                    // confidence tier recording which one answered.
+                    let att = kern
+                        .as_ref()
+                        .and_then(|k| k.query(&t))
+                        .or_else(|| res.resolve(&t, true));
                     let owner = att.as_ref().map(|a| a.owner.clone());
                     let exe = owner.as_ref().map(|o| o.path.clone());
                     // "none" is not just a weaker "local": it is what turns an
@@ -601,6 +885,21 @@ fn run(fallback_mode: policy::Mode) {
                             decided.clear();
                         }
                         decided.insert(flow, verdict);
+
+                        // Phase 2: push the settled verdict into the kernel's
+                        // cache, so a later connect() to this (binary,
+                        // destination) is answered in the socket hook - a cached
+                        // deny fails connect() with EPERM, before any packet.
+                        //
+                        // Only while enforcing. Visibility must never block, but
+                        // the kernel hook has no notion of mode and enforces a
+                        // cached deny unconditionally - so nothing is pushed while
+                        // observing, and the mode switch itself flushes the cache.
+                        if mode.enforcing() {
+                            if let (Some(k), Some(p)) = (kern.as_ref(), exe.as_deref()) {
+                                k.push_verdict(f.proto, f.dst, f.dport, p, matches!(verdict, Verdict::Allow));
+                            }
+                        }
                     }
 
                     // DNS-over-HTTPS, which we cannot observe.
@@ -616,12 +915,16 @@ fn run(fallback_mode: policy::Mode) {
                     }
 
                     if logged.insert(flow) {
+                        // The tier says which backend did the naming (kernel /
+                        // exact / local / port), which is how you verify that
+                        // `attribution kernel` is actually answering rather
+                        // than silently falling back to the procstat scan.
                         println!(
                             "{:<6} {}:{} -> {} ({}) :{}  {}",
                             label,
                             f.src, f.sport, f.dst, host, f.dport,
                             owner.as_ref()
-                                .map(|o| format!("{} [{}] {}", o.command, o.pid, o.path))
+                                .map(|o| format!("{} [{}] {} ({scope})", o.command, o.pid, o.path))
                                 .unwrap_or_else(|| "<unattributed>".into()),
                         );
                     }
@@ -701,6 +1004,67 @@ fn spawn_prompt(
         };
         let _ = tx.send((ans, Pending { exe, dst, dport, host: if host2.is_empty() { None } else { Some(host2) } }));
     });
+}
+
+/// Put the kernel module back to a daemonless-safe state: stop it upcalling
+/// (there is no reader to answer), and flush the verdict cache (no stale cached
+/// deny should keep enforcing with nobody able to revise it). Run by the
+/// watchdog when the daemon dies and by rc.d on stop, so the module falls in
+/// line with the pf failsafe. A no-op if the module is not loaded.
+fn cmd_kernel_reset() {
+    match kernattr::KernAttr::open() {
+        Ok(k) => {
+            k.set_upcall(false);
+            k.flush_verdicts();
+            eprintln!("pfsnitch: kernel upcall cleared and verdict cache flushed");
+        }
+        // No device means no module loaded - nothing to reset.
+        Err(_) => {}
+    }
+}
+
+fn cmd_attribution(args: &[String]) {
+    let path = Path::new(POLICY_PATH);
+    let pol = policy::Policy::load(path);
+    match args.get(2) {
+        None => println!("{}", pol.attribution().as_str()),
+        Some(want) => {
+            let a = match policy::AttributionMode::parse(want) {
+                Some(a) => a,
+                None => {
+                    eprintln!("pfsnitch: unknown attribution backend {want:?}");
+                    eprintln!("  want: kernel | procstat");
+                    std::process::exit(64);
+                }
+            };
+            if a == policy::AttributionMode::Kernel && !Path::new("/dev/pfsnitch").exists() {
+                // Not fatal - the module may be loaded later, and the daemon
+                // falls back to procstat until it is - but silently accepting
+                // a setting that does nothing yet would read as it working.
+                eprintln!("pfsnitch: note: /dev/pfsnitch not present (kldload mac_pfsnitch)");
+                eprintln!("  the daemon will use procstat until the module is loaded");
+            }
+            match policy::set_attribution(path, a) {
+                Ok(()) => {
+                    println!("attribution: {}", a.as_str());
+                    match a {
+                        policy::AttributionMode::Kernel => {
+                            println!("  flows are named by mac_pfsnitch.ko, recorded at socket");
+                            println!("  creation; procstat remains the fallback for a miss");
+                        }
+                        policy::AttributionMode::Procstat => {
+                            println!("  flows are named by scanning the process table (userspace)");
+                        }
+                    }
+                    println!("  the running daemon picks this up within a second");
+                }
+                Err(e) => {
+                    eprintln!("pfsnitch: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 fn cmd_mode(args: &[String]) {
