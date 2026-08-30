@@ -104,9 +104,19 @@ ioctl to ask, and it still names a process that quit right after connecting.
 Sockets the module never saw (started before it loaded) silently fall back to
 the scan, and the log says which backend answered each flow.
 
-Verdicts, policy and packet handling stay in the daemon either way — the module
-attributes, it never decides. Build it from `kmod/`; details and caveats in
-[docs/KERNEL.md](docs/KERNEL.md).
+The module does more than name the process, though **policy always stays in the
+daemon** — the module only ever replays decisions the daemon already made. In
+enforcement it caches those verdicts and enforces them at the socket layer: a
+denied flow fails `connect()` immediately, and **UDP is decided in the kernel
+per packet** (its divert rule retired), so there is no per-datagram userspace
+round trip. TCP keeps its transparent divert-hold; DNS and loopback are exempt.
+
+One honest difference to know: because the module decides UDP at `connect()`
+time, it can prompt once for a *connected*-UDP flow that the divert path never
+saw — including a `connect()` that sends no datagram (some libraries connect a
+UDP socket just to pick a source address). It is a one-time cost per
+destination, then cached. Build it from `kmod/`; the full picture, caveats, and
+this behaviour are in [docs/KERNEL.md](docs/KERNEL.md).
 
 ## Blocked means refused, not hung
 

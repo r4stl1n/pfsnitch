@@ -64,6 +64,17 @@ inherit that skip on its own — without the explicit check, a local UDP tool
 (`ntpq` talking to `127.0.0.1:123`) would be upcalled and fail with `EAGAIN`.
 Loopback was never governed on the divert path, and it isn't here.
 
+**One honest behavioural difference from the divert path.** The hook decides at
+`connect()`/`sendto()` time, which means a *connected* UDP socket is judged the
+moment it connects — including a `connect()` that never sends a datagram. Some
+libraries connect a UDP socket purely to choose a source address (`fetch` does
+this to `example.com:1` before its real TCP fetch). The divert path never saw
+those — no packet, nothing to divert — so the kernel path may prompt once for a
+UDP flow the userspace path ignored. It cannot be avoided without a hole: there
+is no destination at `send()` time, so a connected-UDP flow *must* be decided at
+`connect()` or not at all. The cost is one prompt per new (binary, destination);
+the verdict is then cached and never asked again.
+
 The daemon pushes verdicts only while enforcing and flushes the cache on every
 policy reload, so visibility mode never blocks and a cached verdict never
 outlives its rule. If the daemon dies, the module notices the last close of
