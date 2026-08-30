@@ -621,6 +621,19 @@ fn run(fallback_mode: policy::Mode) {
                 let was = mode;
                 mode = pol.mode(fallback_mode);
                 if pol.attribution() != was_attr {
+                    // Tear the upcall down BEFORE replacing the handle. Otherwise
+                    // switching kernel->procstat nulls `kern` while the kernel's
+                    // upcall is still on, and nothing can reach the module to turn
+                    // it off - leaving it upcalling into a void (loopback UDP and
+                    // everything else stuck on EAGAIN). Use the still-valid handle.
+                    if upcall_on {
+                        if let Some(k) = kern.as_ref() {
+                            k.set_upcall(false);
+                        }
+                        upcall_on = false;
+                        pending_upcalls.clear();
+                        set_udp_divert(true);
+                    }
                     // Same runtime-switch contract as mode: takes effect within
                     // a second, never restarts the daemon or drops the socket.
                     kern = kern_backend(&pol);

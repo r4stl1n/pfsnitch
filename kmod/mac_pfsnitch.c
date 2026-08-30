@@ -584,6 +584,23 @@ pfsn_socket_check_connect(struct ucred *cred, struct socket *so,
 	} else
 		return (0);
 
+	/* Loopback is exempt, matching pf's `set skip on lo0`. This hook lives at
+	 * the socket layer, below pf, so it does NOT inherit skip-on-lo0 - without
+	 * this, local UDP tools (ntpq -> 127.0.0.1:123) would be upcalled and fail
+	 * with EAGAIN. Loopback was never governed on the divert path; keep it so. */
+	if (af == 4) {
+		if (faddr[0] == 127)			/* 127.0.0.0/8 */
+			return (0);
+	} else {
+		static const uint8_t lo6[16] =
+		    { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };	/* ::1 */
+		if (memcmp(faddr, lo6, 16) == 0)
+			return (0);
+		if (faddr[10] == 0xff && faddr[11] == 0xff &&
+		    faddr[12] == 127)			/* ::ffff:127.0.0.0/8 */
+			return (0);
+	}
+
 	/* No label means a socket from before the module loaded - let the
 	 * divert path handle it, exactly as attribution would miss it. The
 	 * label's fields are stable while we hold this socket in connect(). */
