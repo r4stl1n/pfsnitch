@@ -58,6 +58,12 @@ the hook only ever *denies* TCP early (the cached `EPERM`); TCP misses fall
 through to divert. **DNS (port 53)** likewise stays on divert, because the daemon
 learns hostnames from the answers.
 
+**Loopback is exempt.** The hook returns immediately for `127.0.0.0/8` and
+`::1`, matching pf's `set skip on lo0`. The hook sits *below* pf, so it does not
+inherit that skip on its own — without the explicit check, a local UDP tool
+(`ntpq` talking to `127.0.0.1:123`) would be upcalled and fail with `EAGAIN`.
+Loopback was never governed on the divert path, and it isn't here.
+
 The daemon pushes verdicts only while enforcing and flushes the cache on every
 policy reload, so visibility mode never blocks and a cached verdict never
 outlives its rule. If the daemon dies, the module notices the last close of
