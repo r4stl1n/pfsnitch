@@ -123,6 +123,37 @@ the fail-**closed** action. Getting these backwards would either strand the
 machine or silently drop the firewall, which is why the mode is an explicit
 setting rather than implied by the code path.
 
+## The kernel module's failure modes
+
+`mac_pfsnitch` is opt-in (`attribution kernel`), and nothing about the failure
+story above changes without it — the daemon and the divert path are the same. It
+adds three safety concerns of its own, each handled:
+
+- **An unanswered miss.** While the module's upcall is governing UDP, a miss the
+  daemon does not answer (queue full, or a slow prompt) falls back to
+  `security.mac.pfsnitch.failmode` — `0` open (allow) or `1` closed (deny). rc.d
+  syncs it from `pfsnitch_failmode` at start, so the module and the watchdog
+  agree on which way the machine fails.
+
+- **A dead daemon.** Two things reset the kernel state, from both ends. The
+  kernel notices the **last close** of `/dev/pfsnitch` — which a crash produces
+  when the daemon's descriptors close — and disables the upcall *instantly*, so
+  UDP misses stop stalling on `EAGAIN` and fall through to the divert path with
+  no watchdog delay. The **watchdog** then runs `pfsnitch kernel-reset` (clears
+  the upcall and flushes the verdict cache) alongside its usual anchor failsafe,
+  and the daemon itself does the same cleanup on a graceful `SIGTERM`. The
+  all-UDP divert rule the daemon retired lives in a `pfsnitch/udpdivert`
+  sub-anchor that is reloaded whenever the upcall is not active, so UDP is never
+  left both un-diverted and un-decided.
+
+- **A bug is a panic, not a restart.** This is the real cost of moving into the
+  kernel and is not hidden: a fault in a userspace daemon is a restart, a fault
+  in the module takes the machine down. That is why it is built with
+  `panic = abort` discipline in mind, tested under a debug kernel
+  (INVARIANTS/WITNESS) with a fuzz/stress harness, and shipped disabled by
+  default. It is also KBI-bound — a module built for one FreeBSD release refuses
+  to load into another rather than misbehaving — so it is rebuilt per release.
+
 ## Scope: the whole machine, every user
 
 pf filters packets, not sessions, so interception covers every process and every
@@ -181,6 +212,11 @@ are also not "an application connecting somewhere" in the sense this tool
 models, but a determined tunnel could use them.
 
 ## What this costs
+
+Everything below measures the **userspace divert path**. The optional kernel
+module changes the UDP half of the story completely: with it, UDP is decided in
+the kernel per packet, its divert rule is retired, and the per-datagram round
+trip disappears — TCP stays on this path. See [docs/KERNEL.md](KERNEL.md).
 
 Measured, not estimated, on a 9 MB HTTP download over a ~35 Mbit/s link:
 

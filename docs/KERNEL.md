@@ -37,14 +37,34 @@ enumerate.)
 
 Policy stays in the daemon: it alone evaluates hostnames, wildcards, modes and
 per-binary rules. The module holds no policy and resolves nothing — it caches
-*decisions the daemon already made*. As of Phase 2 (see
-[KERNEL-ROADMAP.md](KERNEL-ROADMAP.md)) it does two jobs: attribute a flow to its
-owning binary, and — when the daemon has pushed a settled **deny** for that
-(binary, destination) — fail the `connect()` with `EPERM` in the socket hook,
-before any packet leaves. A cached *allow* or an unknown flow is not blocked;
-it proceeds and is still governed by the divert path. The daemon pushes verdicts
-only while enforcing and flushes the cache on every policy reload, so visibility
-mode never blocks and a cached verdict never outlives its rule.
+and replays *decisions the daemon already made*. It does three jobs:
+
+1. **Attribute** a flow to its owning binary (the whole of Phase 1).
+2. **Cache verdicts** the daemon pushes and enforce them in the socket hook: a
+   cached **deny** fails `connect()`/`sendto()` with `EPERM` before any packet
+   leaves; a cached **allow** returns immediately and lets the flow proceed.
+3. **Govern UDP per packet.** On a UDP miss the hook asks the daemon directly (a
+   fail-fast upcall: the syscall gets `EAGAIN`, the daemon decides asynchronously
+   and caches the answer, and the flow's own retransmission — a QUIC datagram —
+   carries it). With that in place the daemon retires the all-UDP divert rule, so
+   every subsequent datagram is a **bare in-kernel cache lookup, not a userspace
+   round trip**. This is what removes the per-packet UDP cost that motivated the
+   module.
+
+**TCP is deliberately left on the divert path.** Fail-fast has no SYN to
+retransmit for a held `connect()`, and the divert-hold carries a TCP connection
+transparently at one round trip *per connection* — which was never the cost. So
+the hook only ever *denies* TCP early (the cached `EPERM`); TCP misses fall
+through to divert. **DNS (port 53)** likewise stays on divert, because the daemon
+learns hostnames from the answers.
+
+The daemon pushes verdicts only while enforcing and flushes the cache on every
+policy reload, so visibility mode never blocks and a cached verdict never
+outlives its rule. If the daemon dies, the module notices the last close of
+`/dev/pfsnitch` and stops upcalling on its own, and the watchdog runs `pfsnitch
+kernel-reset` to clear the cache; `security.mac.pfsnitch.failmode` (synced from
+`pfsnitch_failmode`) decides what an unanswered miss does in the meantime. See
+[docs/SAFETY.md](SAFETY.md).
 
 The daemon works exactly as before without the module — and
 even with `attribution kernel` set, any socket the module cannot answer for
@@ -61,8 +81,12 @@ creator. The procstat path has the mirror-image ambiguity — it names whoever
 holds the fd at scan time — so neither is strictly stronger; "creator" is the
 more useful answer for an egress prompt.
 
-Where this is going: the module is the first phase of a longer plan to move
-filtering into the kernel — see [KERNEL-ROADMAP.md](KERNEL-ROADMAP.md).
+How this was built, phase by phase — attribution, the verdict cache, the UDP
+upcall, retiring the UDP divert, and the failmode hardening — is in
+[KERNEL-ROADMAP.md](KERNEL-ROADMAP.md), including the two dead ends the design
+hit on the way (a blocking hook is illegal under the framework's non-sleepable
+lock; and DNS's own `sendto` reaching the same hook is what makes UDP reachable
+at all).
 
 ## Building and loading
 

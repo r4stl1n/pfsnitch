@@ -170,6 +170,12 @@ reinjection. Verdicts are cached per flow - without that, one video stream pegge
 a core and the daemon dropped 99% of the traffic it was supposed to be judging.
 With it, a streaming rate costs about 0.5% CPU.
 
+Those numbers are the **divert path's** cost. With the optional kernel module
+governing UDP (`attribution kernel`, enforcement), the per-datagram userspace
+round trip goes away entirely: each UDP packet is decided by an in-kernel cache
+lookup, and the divert rule for UDP is retired. See
+[docs/KERNEL.md](docs/KERNEL.md).
+
 See [docs/SAFETY.md](docs/SAFETY.md#what-this-costs) for the measurements, and
 for why the obvious fix to the TCP cost does not work.
 
@@ -207,8 +213,15 @@ Hostnames come from snooping plaintext DNS replies. DNS-over-HTTPS is invisible
 to this, and such connections appear as bare addresses.
 
 Outbound UDP is diverted too, not just TCP - otherwise QUIC/HTTP3 would bypass
-the whole tool. UDP costs more than TCP does (every packet is diverted, and a
-dropped datagram is not retransmitted); see [docs/SAFETY.md](docs/SAFETY.md).
+the whole tool. On the divert path UDP costs more than TCP (every packet is
+diverted); the optional kernel module removes that by deciding UDP in the kernel
+per packet — see [docs/KERNEL.md](docs/KERNEL.md).
+
+The picture above is the always-present userspace path. The kernel module is an
+opt-in layer *on top of* it — it makes attribution exact and moves UDP filtering
+into the kernel, but the daemon still holds all policy and decides every first
+contact. It is never a replacement for the daemon, and anything it cannot answer
+falls back to the path above.
 
 ## Install
 
